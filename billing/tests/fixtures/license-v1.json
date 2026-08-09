@@ -1,0 +1,35 @@
+{
+  "claims": {
+    "aud": "dmoft-pro",
+    "device_id": "dmoft-device-v1-JPbtasv-EAnAMNfKVnwzykgw",
+    "device_key_sha256": "JPbtasv-EAnAMNfKVnwzykgwkRSYI2tVYabIKr7F3ig",
+    "entitlements": [
+      "camera.live",
+      "optics.adaptive"
+    ],
+    "exp": 2000001000,
+    "grace_until": 2000002000,
+    "iat": 2000000000,
+    "iss": "https://licenses.test",
+    "jti": "00000000-0000-4000-8000-000000000001",
+    "nbf": 1999999995,
+    "sub": "cus_fixture",
+    "subscription_id": "sub_fixture",
+    "tier": "pro",
+    "v": 1
+  },
+  "device_private_key_seed": "ICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj8",
+  "device_public_key": "Kay64UG8yvCyLhqU000LxzYeUm0L_hLIl5S8kyKWbdc",
+  "issuer_keyset": {
+    "keys": [
+      {
+        "alg": "EdDSA",
+        "kid": "fixture-2026",
+        "public_key": "A6EHv_POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg"
+      }
+    ],
+    "v": 1
+  },
+  "issuer_private_key_seed": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+  "token": "eyJhbGciOiJFZERTQSIsImtpZCI6ImZpeHR1cmUtMjAyNiIsInR5cCI6IkRNT0ZULUxJQ0VOU0UiLCJ2IjoxfQ.eyJhdWQiOiJkbW9mdC1wcm8iLCJkZXZpY2VfaWQiOiJkbW9mdC1kZXZpY2UtdjEtSlBidGFzdi1FQW5BTU5mS1Zud3p5a2d3IiwiZGV2aWNlX2tleV9zaGEyNTYiOiJKUGJ0YXN2LUVBbkFNTmZLVm53enlrZ3drUlNZSTJ0VllhYklLcjdGM2lnIiwiZW50aXRsZW1lbnRzIjpbImNhbWVyYS5saXZlIiwib3B0aWNzLmFkYXB0aXZlIl0sImV4cCI6MjAwMDAwMTAwMCwiZ3JhY2VfdW50aWwiOjIwMDAwMDIwMDAsImlhdCI6MjAwMDAwMDAwMCwiaXNzIjoiaHR0cHM6Ly9saWNlbnNlcy50ZXN0IiwianRpIjoiMDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDAwMDAxIiwibmJmIjoxOTk5OTk5OTk1LCJzdWIiOiJjdXNfZml4dHVyZSIsInN1YnNjcmlwdGlvbl9pZCI6InN1Yl9maXh0dXJlIiwidGllciI6InBybyIsInYiOjF9.7cyEqnTQ7DPtHTgRJ-nr3ym5CZCsQtMXrcxUF51HXRU4jTB8F8sUmM0-MfHLAcUP9vL91kGR4BLD2pnSQCuRDg"
+}

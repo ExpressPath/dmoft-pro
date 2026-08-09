@@ -1,0 +1,26 @@
+:root {
+  color-scheme: dark;
+  font-family: Inter, ui-sans-serif, system-ui, sans-serif;
+  background: #07100e;
+  color: #edf8f4;
+}
+
+* { box-sizing: border-box; }
+body { margin: 0; min-height: 100vh; background: radial-gradient(circle at top, #17372e, #07100e 55%); }
+main { width: min(900px, calc(100% - 32px)); margin: 0 auto; padding: 48px 0; }
+header { margin-bottom: 24px; }
+.eyebrow { color: #78e8bd; letter-spacing: .16em; font-size: .75rem; font-weight: 700; }
+h1 { margin: 0; font-size: clamp(2rem, 6vw, 4rem); letter-spacing: -.04em; }
+header p:last-child { color: #a9c3b9; }
+.viewer { position: relative; aspect-ratio: 16 / 9; overflow: hidden; border: 1px solid #315b4d; border-radius: 18px; background: #020504; }
+video { width: 100%; height: 100%; object-fit: cover; }
+#placeholder { position: absolute; inset: 0; display: grid; place-items: center; color: #7e9c90; }
+.controls { display: flex; flex-wrap: wrap; gap: 10px; padding: 18px 0; }
+button { border: 1px solid #3d7964; border-radius: 999px; padding: 10px 18px; background: #12362a; color: inherit; font-weight: 700; cursor: pointer; }
+button:disabled { cursor: not-allowed; opacity: .45; }
+.status { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }
+.status div { padding: 16px; border-radius: 12px; background: #0c1d18; }
+.status span, .status strong { display: block; }
+.status span { color: #7e9c90; font-size: .78rem; }
+#message { grid-column: 1 / -1; color: #f4ce76; min-height: 1.4em; }
+@media (max-width: 640px) { .status { grid-template-columns: 1fr; } }

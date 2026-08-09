@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>DMOFT Pro Camera</title>
+    <link rel="stylesheet" href="/styles.css">
+  </head>
+  <body>
+    <main>
+      <header>
+        <p class="eyebrow">LOCAL OPTICAL RECEIVER</p>
+        <h1>DMOFT Pro Camera</h1>
+        <p>Frames are processed on this device and are never sent to a remote host.</p>
+      </header>
+      <section class="viewer" aria-label="Camera preview">
+        <video id="preview" muted playsinline></video>
+        <canvas id="capture" hidden></canvas>
+        <div id="placeholder">Camera remains off until you press Start.</div>
+      </section>
+      <section class="controls">
+        <button id="start" type="button">Start camera</button>
+        <button id="stop" type="button" disabled>Stop</button>
+        <button id="download" type="button" disabled>Download encrypted result</button>
+      </section>
+      <section class="status" aria-live="polite">
+        <div><span>Status</span><strong id="state">Loading…</strong></div>
+        <div><span>Progress</span><strong id="progress">0%</strong></div>
+        <div><span>Frames</span><strong id="frames">0 accepted / 0 rejected</strong></div>
+        <p id="message"></p>
+      </section>
+    </main>
+    <script src="/app.js" defer></script>
+  </body>
+</html>

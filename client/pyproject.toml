@@ -1,0 +1,74 @@
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dmoft-pro-client"
+version = "0.1.0"
+description = "Licensed local camera client for the DMOFT optical transport"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "BUSL-1.1"
+license-files = ["LICENSE", "NOTICE"]
+authors = [{ name = "DMOFT" }]
+dependencies = [
+  "cryptography>=50,<51",
+  "dmoft>=0.3,<0.4",
+  "fastapi>=0.116,<1",
+  "uvicorn>=0.35,<1",
+]
+
+[project.optional-dependencies]
+dev = [
+  "httpx>=0.28,<1",
+  "mypy>=1.14",
+  "pytest>=8.3",
+  "pytest-cov>=6",
+  "ruff>=0.9",
+]
+
+[project.scripts]
+dmoft-pro = "dmoft_pro_client.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+dmoft_pro_client = ["py.typed", "static/*.html", "static/*.js", "static/*.css"]
+
+[tool.pytest.ini_options]
+addopts = "-ra --strict-config --strict-markers"
+testpaths = ["tests"]
+pythonpath = ["src", "../../dmoft-community/src"]
+filterwarnings = [
+  "ignore:Using `httpx` with `starlette.testclient` is deprecated:starlette.exceptions.StarletteDeprecationWarning",
+]
+
+[tool.coverage.run]
+branch = true
+source = ["dmoft_pro_client"]
+omit = [
+  "*/dmoft_pro_client/__main__.py",
+  "*/dmoft_pro_client/cli.py",
+]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true
+fail_under = 80
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "SIM", "RUF"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["dmoft_pro_client"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+packages = ["dmoft_pro_client"]

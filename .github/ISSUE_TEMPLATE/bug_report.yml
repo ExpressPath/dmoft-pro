@@ -1,0 +1,39 @@
+name: Pro bug report
+description: Report a reproducible live-capture, entitlement, or billing defect
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: Never paste Stripe secrets, signing keys, license tokens, private device keys, or confidential camera frames.
+  - type: input
+    id: version
+    attributes:
+      label: Version
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - Camera client
+        - Localhost capture UI
+        - License activation or refresh
+        - Stripe Checkout or portal
+        - Stripe webhook or entitlements
+        - Documentation / packaging
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Redacted reproduction
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected and actual result
+    validations:
+      required: true
