@@ -29,11 +29,16 @@ continuously read a camera device.
 - Live quality measurement and adaptive scan controls
 - Device-bound offline entitlements
 - Stripe Checkout, Billing Entitlements, webhook reconciliation, and portal
+- Optically pinned hybrid packet coordinator and transport adapter interface
 - Commercial support and certified device profiles when those programs launch
 
-## Roadmap, not included in the MVP
+The hybrid coordinator includes only strict offers/envelopes and a bounded memory
+adapter for tests. It is not a usable LAN or WebRTC transport by itself, and its
+entitlement must not be attached to the launch Product.
 
-- Wi-Fi Direct, local LAN, and USB hybrid transport
+## Roadmap, not included in the production MVP
+
+- Production TLS LAN/WebRTC adapters, discovery, signaling, and Wi-Fi Direct/USB integration
 - Multipath scheduling and differential resume
 - Signed device-profile updates
 - Hardware-backed license and receiver keys

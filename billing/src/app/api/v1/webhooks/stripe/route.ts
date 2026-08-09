@@ -22,6 +22,9 @@ export async function POST(request: Request): Promise<Response> {
     } catch {
       throw new HttpError(400, "invalid_stripe_signature", "Webhook signature verification failed.");
     }
+    if (env.NODE_ENV === "production" && !event.livemode) {
+      throw new HttpError(400, "stripe_mode_mismatch", "A test-mode event cannot update production state.");
+    }
     await processStripeEvent(event);
     return Response.json({ received: true }, { headers: { "Cache-Control": "no-store" } });
   } catch (error) {

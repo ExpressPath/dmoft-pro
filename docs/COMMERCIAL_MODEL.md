@@ -64,7 +64,7 @@ Canonical feature keys are:
 
 - `camera.live`
 - `optics.adaptive`
-- `transport.hybrid` (roadmap; do not attach at launch)
+- `transport.hybrid` (adapter skeleton only; do not attach until production certification)
 
 The service persists Stripe's active entitlements and uses them to issue a
 device-bound token. It never determines access from a browser success redirect,

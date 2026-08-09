@@ -13,9 +13,13 @@ export async function POST(request: Request): Promise<Response> {
     if (!account.stripe_customer_id) {
       throw new HttpError(404, "billing_customer_not_found", "No billing profile exists for this account.");
     }
+    const env = getEnv();
     const session = await getStripe().billingPortal.sessions.create({
       customer: account.stripe_customer_id,
-      return_url: `${getEnv().APP_BASE_URL}/account`,
+      return_url: `${env.APP_BASE_URL}/account`,
+      ...(env.STRIPE_PORTAL_CONFIGURATION_ID
+        ? { configuration: env.STRIPE_PORTAL_CONFIGURATION_ID }
+        : {}),
     });
     return Response.json({ url: session.url }, { headers: { "Cache-Control": "no-store" } });
   } catch (error) {

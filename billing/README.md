@@ -20,6 +20,9 @@ The service never receives camera frames, optical payloads, files, receiver priv
 - At most seven additional offline-grace days, and only when the Stripe entitlement policy explicitly enables it.
 - PostgreSQL-backed fixed-window rate limiting with a replaceable store interface.
 - A rotation-friendly public verification keyset.
+- A fail-closed, read-only production-readiness report for live Stripe catalog,
+  webhook, Portal, refunded canary, PostgreSQL TLS/migrations, OIDC/JWKS, and
+  published policy evidence.
 
 Protocol details are normative for the Pro client: [docs/LICENSE_PROTOCOL_V1.md](docs/LICENSE_PROTOCOL_V1.md).
 
@@ -78,7 +81,7 @@ Create Entitlements features in Stripe and attach them to the corresponding subs
 | --- | --- | --- |
 | Live camera reader | `dmoft_camera_live` | `camera.live` |
 | Adaptive optical tuning | `dmoft_adaptive_optics` | `optics.adaptive` |
-| Hybrid local transport (roadmap; do not attach at launch) | `dmoft_hybrid_transport` | `transport.hybrid` |
+| Hybrid local transport (adapter skeleton; do not attach at launch) | `dmoft_hybrid_transport` | `transport.hybrid` |
 | Pro tier marker | `dmoft_pro` | tier `pro` |
 | Team tier marker | `dmoft_team` | tier `team` |
 | Enterprise tier marker | `dmoft_enterprise` | tier `enterprise` |
@@ -255,6 +258,26 @@ Monitor failed or stale `stripe_events`, Stripe webhook delivery health, activat
 - The webhook payload is retained for idempotency/audit. Apply data-retention controls appropriate to the deployment jurisdiction.
 - Checkout does not configure or advertise a free trial. Although Stripe's `trialing` status is understood for future administrator-configured subscriptions, repeated-trial prevention is not implemented; do not launch a trial until an account-level eligibility policy is added.
 - In production, `APP_BASE_URL`, `OIDC_ISSUER`, `OIDC_JWKS_URL`, and `LICENSE_ISSUER` must use HTTPS. Development/test allows HTTP only on loopback hosts.
+
+## Production readiness
+
+Copy `.env.production.example` only as a variable inventory and inject populated
+values through the deployment secret/config store. Do not commit the populated
+file. Run the static gate before deployment and the full read-only probes after
+the database and live Stripe objects exist:
+
+```powershell
+npm.cmd run readiness:static
+npm.cmd run db:migrate
+npm.cmd run readiness
+```
+
+Both readiness commands emit a versioned JSON report and return non-zero on any
+failed or unavailable gate. The full probe does not create or modify Stripe
+objects. It verifies that the configured low-value live canary Charge is already
+fully refunded. Legal sufficiency and human approval remain external controls;
+the code checks only the published bytes and supplied immutable evidence
+references. See [the production runbook](docs/PRODUCTION_RUNBOOK.md).
 
 ## Checks
 

@@ -98,7 +98,7 @@ def create_app(
     lock = asyncio.Lock()
     app = FastAPI(
         title="DMOFT Pro Local Camera",
-        version="0.1.0",
+        version="0.2.0",
         docs_url=None,
         redoc_url=None,
         openapi_url=None,

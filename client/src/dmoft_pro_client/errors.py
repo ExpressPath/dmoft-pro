@@ -23,3 +23,7 @@ class CameraError(ProClientError):
 
 class LocalApiError(ProClientError):
     """The localhost-only API configuration is unsafe or invalid."""
+
+
+class HybridTransportError(ProClientError):
+    """The optional local hybrid channel or its optical binding is invalid."""

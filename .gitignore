@@ -21,6 +21,7 @@ coverage/
 # Secrets and local state
 .env*
 !.env.example
+!billing/.env.production.example
 *.pem
 *.key
 *.sqlite*

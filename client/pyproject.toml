@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "dmoft-pro-client"
-version = "0.1.0"
+version = "0.2.0"
 description = "Licensed local camera client for the DMOFT optical transport"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -13,7 +13,7 @@ license-files = ["LICENSE", "NOTICE"]
 authors = [{ name = "DMOFT" }]
 dependencies = [
   "cryptography>=50,<51",
-  "dmoft>=0.3,<0.4",
+  "dmoft>=0.4,<0.5",
   "fastapi>=0.116,<1",
   "uvicorn>=0.35,<1",
 ]

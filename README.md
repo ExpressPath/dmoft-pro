@@ -6,9 +6,11 @@ optical protocol. It adds explicit camera access, adaptive real-time scanning,
 and a Stripe-backed commercial entitlement system without moving optical frame
 content off the local device.
 
-> Status: engineering MVP. The protocol and safety checks are implemented and
-> tested, but the product has not completed independent cryptographic review,
-> camera certification, app-store review, or production payment deployment.
+> Status: engineering MVP with explicit experimental-extension and production
+> readiness skeletons. The protocol and safety checks are implemented and tested,
+> but the product has not completed independent cryptographic review, physical
+> camera certification, production hybrid-adapter validation, legal approval, or
+> a real production payment deployment.
 
 ## Repository layout
 
@@ -29,7 +31,7 @@ content off the local device.
 | Live camera device access | No | Yes |
 | Browser localhost capture UI | No | Yes |
 | Adaptive live scan control | No | Yes |
-| Hybrid LAN/Wi-Fi Direct/USB routing | No | Planned; not yet shipped |
+| Hybrid local transport coordinator | No network routing | Adapter contract; no production adapter |
 | Security fixes and interoperability updates | Yes | Inherited immediately |
 
 The paid boundary is an integration and operations boundary. Confidentiality,
@@ -62,6 +64,20 @@ Copy-Item .env.example .env.local
 npm.cmd install
 npm.cmd run dev
 ```
+
+Production release configuration is independently fail-closed:
+
+```powershell
+Set-Location billing
+npm.cmd run readiness:static
+npm.cmd run readiness
+```
+
+The full command performs read-only Stripe, PostgreSQL, OIDC/JWKS, and published
+policy probes. It cannot supply business verification, legal approval, real
+secrets, domains, or the required refunded live canary; those remain explicit
+operator-controlled gates documented in
+[the production-readiness design](docs/design/STRIPE_PRODUCTION_READINESS.md).
 
 The local UI must bind to loopback. Camera access is requested only after a
 user gesture and can be stopped at any time. Captured frames are decoded by the
