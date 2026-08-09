@@ -41,7 +41,7 @@ addopts = "-ra --strict-config --strict-markers"
 testpaths = ["tests"]
 pythonpath = ["src", "../../dmoft-community/src"]
 filterwarnings = [
-  "ignore:Using `httpx` with `starlette.testclient` is deprecated:starlette.exceptions.StarletteDeprecationWarning",
+  "ignore:Using `httpx` with `starlette.testclient` is deprecated:DeprecationWarning",
 ]
 
 [tool.coverage.run]

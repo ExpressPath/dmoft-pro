@@ -18,6 +18,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: ExpressPath/dmoft-community
+          ref: e0c0e3341efe847b66c3fa28f86ece260a0e2e60
           path: dmoft-community
       - uses: actions/setup-python@v5
         with:
