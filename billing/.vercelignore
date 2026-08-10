@@ -1,0 +1,7 @@
+.vercel/
+.env*
+node_modules/
+.next/
+coverage/
+AGENTS.md
+CLAUDE.md
