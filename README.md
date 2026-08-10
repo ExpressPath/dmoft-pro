@@ -105,3 +105,9 @@ Do not use this MVP as the sole control for high-value financial authorization.
 Review [SECURITY.md](SECURITY.md), keep explicit confirmation on the receiving
 device, and independently validate the Community cryptographic implementation
 before production use.
+
+Repository publishing uses keyring-backed GitHub CLI authentication and never
+stores passkeys or tokens in project files. Run
+`powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\verify-github-auth.ps1`
+and see
+[GitHub authentication](docs/GITHUB_AUTHENTICATION.md).
