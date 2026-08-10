@@ -5,7 +5,7 @@
   "type": "module",
   "description": "DMOFT Pro Stripe subscription, entitlement, device activation, and offline license service",
   "engines": {
-    "node": ">=22.0.0"
+    "node": "22.x"
   },
   "scripts": {
     "dev": "next dev",
