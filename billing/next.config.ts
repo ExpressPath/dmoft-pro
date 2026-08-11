@@ -15,7 +15,9 @@ const nextConfig: NextConfig = {
         { key: "Referrer-Policy", value: "no-referrer" },
         { key: "X-Content-Type-Options", value: "nosniff" },
         { key: "X-Frame-Options", value: "DENY" },
-        { key: "Permissions-Policy", value: "camera=(), microphone=(), geolocation=()" },
+        // Camera remains same-origin only and is requested exclusively after an
+        // explicit gesture on /optical-lab. Microphone and geolocation stay off.
+        { key: "Permissions-Policy", value: "camera=(self), microphone=(), geolocation=()" },
       ],
     }];
   },
