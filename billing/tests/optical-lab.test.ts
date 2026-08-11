@@ -4,10 +4,14 @@ import {
   C8_QR_PALETTE,
   DynamicLabDecoder,
   LAB_CHROMA_RADIX,
+  LAB_FRAME,
+  LAB_MICRO_DERIVED_QUIET_MODULES,
   LAB_OBJECT_BYTES,
+  LAB_PACKET_BYTES,
   LAB_PACKET_COPIES,
   LAB_PALETTE_SIZE,
   LAB_QR_MODULES,
+  LAB_QUIET_ZONE_AREA_GAIN,
   LAB_SOURCE_CHUNK_COUNT,
   LAB_SYMBOLS_PER_PACKET,
   applyChromaMask,
@@ -39,20 +43,34 @@ const PREPARED = prepareDynamicFrame(SESSION, OBJECT.bytes, 3, ORIGIN);
 describe("integrated QR-family dynamic stream", () => {
   it("builds a larger deterministic multi-frame source object", () => {
     expect(OBJECT.sessionHex).toBe("1021324354657687");
-    expect(OBJECT.message).toBe("INTEGRATED-DYNAMIC-QR-OK");
+    expect(OBJECT.message).toBe("MICROTECH-DYNAMIC-QR-OK");
     expect(OBJECT.bytes).toHaveLength(LAB_OBJECT_BYTES);
-    expect(LAB_OBJECT_BYTES).toBe(1536);
+    expect(LAB_OBJECT_BYTES).toBe(2048);
   });
 
-  it("uses one Version 10 QR matrix for geometry, bootstrap, pilots, and chroma payload", () => {
+  it("uses one Version 10 QR matrix with Micro-derived margin and compact pilots", () => {
     const { matrix } = PREPARED;
     const reservedCount = Array.from(matrix.reserved).filter(Boolean).length;
+    const globalPilots = matrix.pilots.filter((pilot) => pilot.scope === "global");
+    const localPilots = matrix.pilots.filter((pilot) => pilot.scope === "local");
 
     expect(matrix.size).toBe(LAB_QR_MODULES);
     expect(matrix.bits).toHaveLength(LAB_QR_MODULES ** 2);
     expect(reservedCount).toBeGreaterThan(400);
     expect(matrix.payloadCells.length).toBeGreaterThanOrEqual(LAB_SYMBOLS_PER_PACKET * LAB_PACKET_COPIES);
-    expect(new Set(matrix.pilots.map((pilot) => pilot.paletteState)).size).toBe(LAB_PALETTE_SIZE);
+    expect(globalPilots).toHaveLength(32);
+    expect(new Set(globalPilots.map((pilot) => pilot.paletteState)).size).toBe(LAB_PALETTE_SIZE);
+    for (let state = 0; state < LAB_PALETTE_SIZE; state += 1) {
+      const regions = globalPilots
+        .filter((pilot) => pilot.paletteState === state)
+        .map((pilot) => `${pilot.row < matrix.size / 2 ? "top" : "bottom"}:${pilot.column < matrix.size / 2 ? "left" : "right"}`);
+      expect(new Set(regions).size).toBe(4);
+    }
+    expect(localPilots.length).toBeGreaterThan(80);
+    expect(matrix.pilots.length).toBeLessThan(160);
+    expect(LAB_FRAME.quietModules).toBe(LAB_MICRO_DERIVED_QUIET_MODULES);
+    expect(LAB_FRAME.width).toBe((LAB_QR_MODULES + (2 * LAB_MICRO_DERIVED_QUIET_MODULES)) * LAB_FRAME.modulePitch);
+    expect(LAB_QUIET_ZONE_AREA_GAIN).toBeGreaterThan(1.13);
   });
 
   it("preserves every underlying QR luminance bit while using black and white as data states", () => {
@@ -75,7 +93,7 @@ describe("integrated QR-family dynamic stream", () => {
   });
 
   it("round-trips frame bytes through two-bit chroma symbols", () => {
-    const bytes = new Uint8Array(256);
+    const bytes = new Uint8Array(LAB_PACKET_BYTES);
     for (let index = 0; index < bytes.length; index += 1) bytes[index] = (index * 73 + 19) & 0xff;
 
     const symbols = encodeBytesToQuaternary(bytes);
@@ -137,7 +155,7 @@ describe("integrated QR-family dynamic stream", () => {
     }
 
     expect(decoder.canRecoverObject()).toBe(true);
-    expect(decoder.reconstruct().message).toBe("INTEGRATED-DYNAMIC-QR-OK");
+    expect(decoder.reconstruct().message).toBe("MICROTECH-DYNAMIC-QR-OK");
   });
 
   it("carries dynamic control metadata in the same QR luminance matrix", () => {
@@ -164,7 +182,7 @@ describe("integrated camera-space calibration and QR geometry", () => {
       [[220, 130, 207], [222, 128, 209]],
     ];
     const global = estimatePalette(shifted);
-    const local = localizePalette(global, shifted.map((samples) => samples[0]));
+    const local = localizePalette(global, [shifted[0][0], shifted[4][0]]);
 
     const decoded = classifyColor([58, 193, 201], local);
 

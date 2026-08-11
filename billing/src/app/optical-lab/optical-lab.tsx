@@ -10,6 +10,7 @@ import {
   LAB_OBJECT_BYTES,
   LAB_PALETTE_SIZE,
   LAB_PROFILE_NAME,
+  LAB_QUIET_ZONE_AREA_GAIN,
   LAB_QR_ERROR_CORRECTION,
   LAB_QR_VERSION,
   LAB_SOURCE_CHUNK_COUNT,
@@ -375,7 +376,7 @@ export function OpticalLab({ initialRole }: { initialRole: Role }) {
           </div>
           <ol className={styles.instructions}>
             <li>同じ正方形コードをスマホ標準カメラで読み、readerリンクを開きます。</li>
-            <li>readerで「カメラを開始」を押し、4-module quiet zoneを含む正方形全体を映します。</li>
+            <li>readerで「カメラを開始」を押し、Micro QR由来の2-module quiet zoneを含む正方形全体を映します。</li>
             <li>黒白のQR輝度面が幾何とbootstrapを、同じmodule内の8色chroma面が動的データを運びます。</li>
           </ol>
           <div className={styles.frameShell}>
@@ -397,6 +398,7 @@ export function OpticalLab({ initialRole }: { initialRole: Role }) {
             <span>QR base <strong>V{LAB_QR_VERSION} / {LAB_QR_ERROR_CORRECTION}</strong></span>
             <span>Palette <strong>8 states · black/white included</strong></span>
             <span>Payload <strong>2 chroma bits / module</strong></span>
+            <span>Quiet zone <strong>2 modules · +{((LAB_QUIET_ZONE_AREA_GAIN - 1) * 100).toFixed(1)}% area efficiency</strong></span>
             <span>Usable modules <strong>{senderMetrics?.payloadCells ?? "…"}</strong></span>
             <span>Integrated pilots <strong>{senderMetrics?.pilotCells ?? "…"}</strong></span>
             <span>Self-test <strong>{senderSelfTest}</strong></span>
@@ -404,7 +406,8 @@ export function OpticalLab({ initialRole }: { initialRole: Role }) {
           </div>
           <p className={styles.algorithmNote}>
             Function moduleは純粋な黒白のまま保持します。Data moduleはQR bitがdarkなら黒・赤・濃緑・青、lightなら白・黄・cyan・magentaから選択し、
-            CIE Lab色差・同色隣接・時間遷移を評価して16個の可逆maskから最良を選びます。独立した校正帯や別QRはありません。
+            CIE Lab色差・同色隣接・時間遷移を評価して16個の可逆maskから最良を選びます。Micro QR由来の2-module marginと、
+            global 8-color pilots＋tileごとのblack/white anchorsで校正面積を圧縮します。独立した校正帯や別QRはありません。
           </p>
         </section>
       ) : (
@@ -525,19 +528,22 @@ function decodeCameraImage(image: ImageData, location: QrLocation, bootstrap: st
   const tileSamples = new Map<string, Map<number, Rgb>>();
   for (const pilot of matrix.pilots) {
     const observed = sampleRgb(image, projectPoint(homography, moduleCenter(pilot)), sampleRadius);
-    globalSamples[pilot.paletteState].push(observed);
-    const key = tileKey(pilot.tileRow, pilot.tileColumn);
-    const group = tileSamples.get(key) ?? new Map<number, Rgb>();
-    group.set(pilot.paletteState, observed);
-    tileSamples.set(key, group);
+    if (pilot.scope === "global") {
+      globalSamples[pilot.paletteState].push(observed);
+    } else {
+      const key = tileKey(pilot.tileRow, pilot.tileColumn);
+      const group = tileSamples.get(key) ?? new Map<number, Rgb>();
+      group.set(pilot.paletteState, observed);
+      tileSamples.set(key, group);
+    }
   }
   const globalPalette = estimatePalette(globalSamples);
   const localModels = new Map<string, ReturnType<typeof localizePalette>>();
   for (const [key, samples] of tileSamples) {
-    if (samples.size !== LAB_PALETTE_SIZE) continue;
+    if (!samples.has(0) || !samples.has(4)) continue;
     localModels.set(key, localizePalette(
       globalPalette,
-      Array.from({ length: LAB_PALETTE_SIZE }, (_, state) => samples.get(state) as Rgb),
+      [samples.get(0) as Rgb, samples.get(4) as Rgb],
     ));
   }
 

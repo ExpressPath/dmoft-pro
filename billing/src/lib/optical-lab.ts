@@ -3,26 +3,32 @@ import QRCode from "qrcode";
 export const LAB_QR_VERSION = 10;
 export const LAB_QR_MODULES = 17 + (4 * LAB_QR_VERSION);
 export const LAB_QR_ERROR_CORRECTION = "H" as const;
+export const LAB_STANDARD_QR_QUIET_MODULES = 4;
+export const LAB_MICRO_DERIVED_QUIET_MODULES = 2;
+export const LAB_QUIET_ZONE_AREA_GAIN = (
+  (LAB_QR_MODULES + (2 * LAB_STANDARD_QR_QUIET_MODULES))
+  / (LAB_QR_MODULES + (2 * LAB_MICRO_DERIVED_QUIET_MODULES))
+) ** 2;
 export const LAB_FRAME = {
-  width: 780,
-  height: 780,
-  qrX: 48,
-  qrY: 48,
+  width: 732,
+  height: 732,
+  qrX: 24,
+  qrY: 24,
   qrSize: 684,
   modulePitch: 12,
   moduleCount: LAB_QR_MODULES,
-  quietModules: 4,
+  quietModules: LAB_MICRO_DERIVED_QUIET_MODULES,
   tileSize: 8,
 } as const;
 
-export const LAB_PROFILE_NAME = "PRISM-C8-QR-INTEGRATED1";
-export const LAB_BOOTSTRAP_PREFIX = "PRISM-IQR1";
+export const LAB_PROFILE_NAME = "PRISM-C8-QR-MICROTECH2";
+export const LAB_BOOTSTRAP_PREFIX = "PRISM-IQR2";
 export const LAB_TARGET_FPS = 8;
 export const LAB_PALETTE_SIZE = 8;
 export const LAB_CHROMA_RADIX = 4;
-export const LAB_PACKET_BYTES = 256;
+export const LAB_PACKET_BYTES = 320;
 export const LAB_PACKET_COPIES = 2;
-export const LAB_SOURCE_CHUNK_BYTES = 192;
+export const LAB_SOURCE_CHUNK_BYTES = 256;
 export const LAB_SOURCE_CHUNK_COUNT = 8;
 export const LAB_OBJECT_BYTES = LAB_SOURCE_CHUNK_BYTES * LAB_SOURCE_CHUNK_COUNT;
 export const LAB_SYMBOLS_PER_PACKET = LAB_PACKET_BYTES * 4;
@@ -42,14 +48,14 @@ export const C8_QR_PALETTE = [
 
 const PACKET_MAGIC = new Uint8Array([0x44, 0x4d, 0x4f, 0x46]);
 const OBJECT_MAGIC = new Uint8Array([0x50, 0x47, 0x44, 0x4f]);
-const FRAME_VERSION = 3;
-const C8_INTEGRATED_PROFILE_CODE = 8;
+const FRAME_VERSION = 4;
+const C8_MICROTECH_PROFILE_CODE = 9;
 const OUTER_XOR_CODE = 1;
 const FRAME_PAYLOAD_OFFSET = 32;
 const FRAME_CRC_OFFSET = LAB_PACKET_BYTES - 4;
 const OBJECT_CRC_OFFSET = LAB_OBJECT_BYTES - 4;
-const OBJECT_MESSAGE = new TextEncoder().encode("INTEGRATED-DYNAMIC-QR-OK");
-const PILOTS_PER_LUMINANCE_CLASS = 4;
+const OBJECT_MESSAGE = new TextEncoder().encode("MICROTECH-DYNAMIC-QR-OK");
+const GLOBAL_PILOT_REPEATS = 4;
 
 export type Point = Readonly<{ x: number; y: number }>;
 export type Rgb = Readonly<[number, number, number]>;
@@ -62,7 +68,10 @@ export type IntegratedCell = Readonly<{
   tileColumn: number;
 }>;
 
-export type IntegratedPilot = Readonly<IntegratedCell & { paletteState: number }>;
+export type IntegratedPilot = Readonly<IntegratedCell & {
+  paletteState: number;
+  scope: "global" | "local";
+}>;
 
 export type IntegratedQrMatrix = Readonly<{
   size: number;
@@ -137,7 +146,7 @@ export function buildLabObject(sessionNonce: Uint8Array): DynamicLabObject {
   bytes.set(OBJECT_MAGIC, 0);
   bytes[4] = 0;
   bytes[5] = FRAME_VERSION;
-  bytes[6] = C8_INTEGRATED_PROFILE_CODE;
+  bytes[6] = C8_MICROTECH_PROFILE_CODE;
   bytes[7] = OUTER_XOR_CODE;
   bytes.set(sessionNonce, 8);
   bytes[16] = OBJECT_MESSAGE.length;
@@ -159,7 +168,7 @@ export function parseLabObject(input: Uint8Array): DynamicLabObject {
   if (
     bytes[4] !== 0
     || bytes[5] !== FRAME_VERSION
-    || bytes[6] !== C8_INTEGRATED_PROFILE_CODE
+    || bytes[6] !== C8_MICROTECH_PROFILE_CODE
     || bytes[7] !== OUTER_XOR_CODE
   ) throw new Error("lab object profile is not supported");
   const expectedCrc = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength).getUint32(OBJECT_CRC_OFFSET, false);
@@ -215,13 +224,12 @@ export function buildDynamicFrame(
   bytes[4] = 0;
   bytes[5] = FRAME_VERSION;
   bytes[6] = frameKind === "systematic" ? 0 : 1;
-  bytes[7] = C8_INTEGRATED_PROFILE_CODE;
+  bytes[7] = C8_MICROTECH_PROFILE_CODE;
   bytes.set(sessionNonce, 8);
   new DataView(bytes.buffer).setUint16(16, sequence, false);
   bytes[18] = maskId;
   bytes[19] = LAB_SOURCE_CHUNK_COUNT;
-  bytes[20] = LAB_SOURCE_CHUNK_BYTES;
-  bytes[21] = LAB_PACKET_COPIES;
+  new DataView(bytes.buffer).setUint16(20, LAB_SOURCE_CHUNK_BYTES, false);
   bytes[22] = equationMask;
   bytes[23] = OUTER_XOR_CODE;
   new DataView(bytes.buffer).setUint16(24, object.bytes.length, false);
@@ -239,14 +247,13 @@ export function parseDynamicFrame(input: Uint8Array): DynamicLabFrame {
   if (
     bytes[4] !== 0
     || bytes[5] !== FRAME_VERSION
-    || bytes[7] !== C8_INTEGRATED_PROFILE_CODE
+    || bytes[7] !== C8_MICROTECH_PROFILE_CODE
     || bytes[23] !== OUTER_XOR_CODE
   ) throw new Error("dynamic frame profile is not supported");
   if (bytes[6] !== 0 && bytes[6] !== 1) throw new Error("dynamic frame kind is invalid");
   if (
     bytes[19] !== LAB_SOURCE_CHUNK_COUNT
-    || bytes[20] !== LAB_SOURCE_CHUNK_BYTES
-    || bytes[21] !== LAB_PACKET_COPIES
+    || new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength).getUint16(20, false) !== LAB_SOURCE_CHUNK_BYTES
     || new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength).getUint16(30, false) !== LAB_SOURCE_CHUNK_BYTES
   ) throw new Error("dynamic frame source geometry is invalid");
   if (bytes[18] > 15 || bytes[22] === 0) throw new Error("dynamic frame mask metadata is invalid");
@@ -414,7 +421,7 @@ export function parseBootstrapUrl(value: string, expectedOrigin?: string): Boots
   if (!secureOrigin || (expectedOrigin && url.origin !== expectedOrigin) || url.pathname !== "/optical-lab" || url.searchParams.get("role") !== "reader") {
     throw new Error("bootstrap URL is not an accepted optical-lab origin");
   }
-  const match = url.hash.match(/^#PRISM-IQR1\.([0-9a-f]{16})\.([0-9a-z]+)\.([0-9a-f])$/);
+  const match = url.hash.match(/^#PRISM-IQR2\.([0-9a-f]{16})\.([0-9a-z]+)\.([0-9a-f])$/);
   if (!match) throw new Error("bootstrap control header is invalid");
   const sequence = Number.parseInt(match[2], 36);
   const maskId = Number.parseInt(match[3], 16);
@@ -534,19 +541,23 @@ export function estimatePalette(samples: readonly (readonly Rgb[])[]): PaletteMo
 }
 
 export function localizePalette(globalModel: PaletteModel, pilots: readonly Rgb[]): PaletteModel {
-  if (pilots.length !== LAB_PALETTE_SIZE || globalModel.means.length !== LAB_PALETTE_SIZE) {
-    throw new Error("an integrated tile needs eight local pilot observations");
+  if (pilots.length !== 2 || globalModel.means.length !== LAB_PALETTE_SIZE) {
+    throw new Error("an integrated tile needs black and white local anchor observations");
   }
-  const shift: [number, number, number] = [0, 0, 0];
-  for (let symbol = 0; symbol < LAB_PALETTE_SIZE; symbol += 1) {
-    for (let channel = 0; channel < 3; channel += 1) {
-      shift[channel] += (pilots[symbol][channel] - globalModel.means[symbol][channel]) / LAB_PALETTE_SIZE;
-    }
-  }
-  const means = pilots.map((pilot, symbol) => [0, 1, 2].map((channel) => (
-    (0.65 * pilot[channel]) + (0.35 * (globalModel.means[symbol][channel] + shift[channel]))
+  const black = pilots[0];
+  const white = pilots[1];
+  const gains = [0, 1, 2].map((channel) => {
+    const globalSpan = globalModel.means[LAB_CHROMA_RADIX][channel] - globalModel.means[0][channel];
+    const observedSpan = white[channel] - black[channel];
+    return Math.max(0.35, Math.min(2.5, observedSpan / Math.max(24, globalSpan)));
+  });
+  const means = globalModel.means.map((mean) => [0, 1, 2].map((channel) => Math.max(0, Math.min(255,
+    black[channel] + ((mean[channel] - globalModel.means[0][channel]) * gains[channel]),
+  ))) as [number, number, number]);
+  const inverseVariances = globalModel.inverseVariances.map((variances) => [0, 1, 2].map((channel) => (
+    variances[channel] / (gains[channel] ** 2)
   )) as [number, number, number]);
-  return { means, inverseVariances: globalModel.inverseVariances };
+  return { means, inverseVariances };
 }
 
 export function classifyColor(observed: Rgb, model: PaletteModel): SoftClassification {
@@ -614,30 +625,63 @@ export function crc32(bytes: Uint8Array): number {
 
 function selectIntegratedPilots(bits: Uint8Array, reserved: Uint8Array, size: number): IntegratedPilot[] {
   const pilots: IntegratedPilot[] = [];
+  const selected = new Set<number>();
+  const candidates: IntegratedCell[] = [];
+  for (let row = 0; row < size; row += 1) {
+    for (let column = 0; column < size; column += 1) {
+      const cell = createCell(row, column, size);
+      if (!reserved[cell.index]) candidates.push(cell);
+    }
+  }
+
+  // A small, spatially distributed set estimates all camera-space colors once.
+  // Local tiles then spend only two modules on black/white gain and offset anchors.
+  for (let paletteState = 0; paletteState < LAB_PALETTE_SIZE; paletteState += 1) {
+    const wantsDark = paletteState < LAB_CHROMA_RADIX;
+    for (let region = 0; region < GLOBAL_PILOT_REPEATS; region += 1) {
+      const available = candidates
+        .filter((cell) => (
+          !selected.has(cell.index)
+          && (bits[cell.index] === 1) === wantsDark
+          && globalPilotRegion(cell, size) === region
+        ))
+        .sort((left, right) => (
+          pilotSelectionKey(left, 1 + paletteState * GLOBAL_PILOT_REPEATS + region)
+          - pilotSelectionKey(right, 1 + paletteState * GLOBAL_PILOT_REPEATS + region)
+          || left.index - right.index
+        ));
+      if (available.length === 0) throw new Error("integrated QR cannot place spatial global palette pilots");
+      const cell = available[0];
+      selected.add(cell.index);
+      pilots.push({ ...cell, paletteState, scope: "global" });
+    }
+  }
+
   const tileCount = Math.ceil(size / LAB_FRAME.tileSize);
   for (let tileRow = 0; tileRow < tileCount; tileRow += 1) {
     for (let tileColumn = 0; tileColumn < tileCount; tileColumn += 1) {
-      const dark: IntegratedCell[] = [];
-      const light: IntegratedCell[] = [];
-      const rowStart = tileRow * LAB_FRAME.tileSize;
-      const columnStart = tileColumn * LAB_FRAME.tileSize;
-      for (let row = rowStart; row < Math.min(size, rowStart + LAB_FRAME.tileSize); row += 1) {
-        for (let column = columnStart; column < Math.min(size, columnStart + LAB_FRAME.tileSize); column += 1) {
-          const cell = createCell(row, column, size);
-          if (reserved[cell.index]) continue;
-          (bits[cell.index] ? dark : light).push(cell);
-        }
-      }
-      if (dark.length < PILOTS_PER_LUMINANCE_CLASS || light.length < PILOTS_PER_LUMINANCE_CLASS) continue;
-      dark.sort((left, right) => pilotSelectionKey(left) - pilotSelectionKey(right) || left.index - right.index);
-      light.sort((left, right) => pilotSelectionKey(left) - pilotSelectionKey(right) || left.index - right.index);
-      for (let state = 0; state < PILOTS_PER_LUMINANCE_CLASS; state += 1) {
-        pilots.push({ ...dark[state], paletteState: state });
-        pilots.push({ ...light[state], paletteState: state + LAB_CHROMA_RADIX });
+      const inTile = candidates.filter((cell) => (
+        cell.tileRow === tileRow && cell.tileColumn === tileColumn && !selected.has(cell.index)
+      ));
+      const dark = inTile
+        .filter((cell) => bits[cell.index] === 1)
+        .sort((left, right) => pilotSelectionKey(left, 17) - pilotSelectionKey(right, 17) || left.index - right.index);
+      const light = inTile
+        .filter((cell) => bits[cell.index] === 0)
+        .sort((left, right) => pilotSelectionKey(left, 29) - pilotSelectionKey(right, 29) || left.index - right.index);
+      if (dark.length > 0 && light.length > 0) {
+        selected.add(dark[0].index);
+        selected.add(light[0].index);
+        pilots.push({ ...dark[0], paletteState: 0, scope: "local" });
+        pilots.push({ ...light[0], paletteState: LAB_CHROMA_RADIX, scope: "local" });
       }
     }
   }
-  if (new Set(pilots.map((pilot) => pilot.paletteState)).size !== LAB_PALETTE_SIZE) {
+  const globalPilots = pilots.filter((pilot) => pilot.scope === "global");
+  if (
+    globalPilots.length !== LAB_PALETTE_SIZE * GLOBAL_PILOT_REPEATS
+    || new Set(globalPilots.map((pilot) => pilot.paletteState)).size !== LAB_PALETTE_SIZE
+  ) {
     throw new Error("integrated QR cannot place a complete camera-space palette");
   }
   return pilots;
@@ -751,8 +795,21 @@ function createCell(row: number, column: number, size: number): IntegratedCell {
   };
 }
 
-function pilotSelectionKey(cell: IntegratedCell): number {
-  return hash32(Math.imul(cell.row + 1, 0x45d9f3b) ^ Math.imul(cell.column + 1, 0x119de1f3));
+function pilotSelectionKey(cell: IntegratedCell, salt: number): number {
+  return hash32(
+    Math.imul(cell.row + 1, 0x45d9f3b)
+    ^ Math.imul(cell.column + 1, 0x119de1f3)
+    ^ Math.imul(salt, 0x9e3779b1),
+  );
+}
+
+function globalPilotRegion(cell: IntegratedCell, size: number): number {
+  const bottom = cell.row >= size / 2;
+  const right = cell.column >= size / 2;
+  if (!bottom && !right) return 0;
+  if (!bottom && right) return 1;
+  if (bottom && right) return 2;
+  return 3;
 }
 
 function cellInterleaveKey(cell: IntegratedCell): number {
