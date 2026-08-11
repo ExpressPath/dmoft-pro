@@ -138,6 +138,16 @@
   font-weight: 750;
 }
 
+.algorithmNote {
+  margin: 18px 0 0;
+  padding: 14px 16px;
+  border-left: 3px solid rgba(112, 240, 189, 0.62);
+  color: #98a7ba;
+  background: rgba(0, 0, 0, 0.18);
+  font-size: 0.8rem;
+  line-height: 1.75;
+}
+
 .cameraShell {
   position: relative;
   overflow: hidden;
@@ -227,6 +237,33 @@
   margin: 16px 0 0;
   color: #bdc8d8;
   line-height: 1.65;
+}
+
+.progressPanel {
+  margin-top: 18px;
+  padding: 16px;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: rgba(0, 0, 0, 0.16);
+}
+
+.progressPanel .metrics {
+  margin-top: 14px;
+}
+
+.progressTrack {
+  overflow: hidden;
+  height: 8px;
+  border-radius: 999px;
+  background: #242b37;
+}
+
+.progressTrack span {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, #38c790, var(--free));
+  transition: width 160ms ease;
 }
 
 .successPanel {
