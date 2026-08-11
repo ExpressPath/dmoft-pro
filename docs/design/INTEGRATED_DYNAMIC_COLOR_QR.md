@@ -1,6 +1,6 @@
 # Prism Joint-Max Dynamic Color QR
 
-Status: experimental browser profile (`PRISM-C8-QR-JOINTMAX3`)
+Status: experimental browser profile (`PRISM-C8-QR-RX4`)
 
 This document specifies the implemented optimization that jointly improves
 area efficiency, inner error recovery, and reading speed. It distinguishes
@@ -40,7 +40,7 @@ The previous profile embedded session, sequence, and mask metadata in the QR
 URL. That forced a Version 10/H luminance matrix and regenerated a different QR
 matrix for every mask candidate and every frame.
 
-`JOINTMAX3` moves dynamic control into the protected chroma packet. The QR
+`RX4` keeps dynamic control inside the protected chroma packet. The QR
 luminance plane is the constant same-origin URL:
 
 ```text
@@ -52,9 +52,11 @@ so the carrier falls from 57 x 57 to 37 x 37 modules while retaining standard
 three-finder QR detection, timing, alignment, masking, and level-H
 Reed-Solomon protection for the luminance bootstrap.
 
-The custom profile retains the Micro-QR-derived two-module quiet zone. It is
-not a standards-compliant Micro QR symbol because it still uses a normal QR
-Version 5 matrix.
+The acquisition profile uses the standard four-module QR quiet zone. A
+two-module margin is valid for Micro QR's different geometry, but applying it
+to a normal three-finder Version 5 symbol reduced real camera acquisition.
+Compact two-module operation is therefore disabled until negotiated from
+measured receiver capability; this profile does not claim Micro QR conformance.
 
 ### 2.2 Area equations
 
@@ -68,14 +70,14 @@ A_old = 61^2 = 3721 module-pitches^2
 The current footprint is
 
 ```text
-L_new = 37 + 2*2 = 41 modules
-A_new = 41^2 = 1681 module-pitches^2
+L_new = 37 + 2*4 = 45 modules
+A_new = 45^2 = 2025 module-pitches^2
 ```
 
 Therefore the same-pitch footprint efficiency is
 
 ```text
-G_area = A_old / A_new = (61/41)^2 = 2.2136
+G_area = A_old / A_new = (61/45)^2 = 1.8375
 ```
 
 The source payload per accepted frame changes from 256 to 174 bytes. The
@@ -83,11 +85,11 @@ verified source density therefore improves by
 
 ```text
 G_source-density
-  = (174 / 41^2) / (256 / 61^2)
-  = 1.5049
+  = (174 / 45^2) / (256 / 61^2)
+  = 1.2492
 ```
 
-This is the meaningful area result: **50.5% more verified source bytes per
+This is the meaningful area result: **24.9% more verified source bytes per
 symbol area per accepted frame**, not a claim that every frame carries more
 absolute bytes.
 
@@ -108,7 +110,10 @@ QR code exists.
 ## 3. Dual-use color modulation
 
 Every non-function module preserves its QR luminance bit and adds two chroma
-bits:
+bits. The entire module is first painted black or white according to the QR
+bit; only the central `14/16 = 0.875` width is painted with the chroma state.
+The one-pixel-per-side luminance guard suppresses display bleed without
+fragmenting the QR data plane:
 
 ```text
 QR DARK  -> {black, red, dark green, blue}
@@ -128,8 +133,11 @@ with confidence
 confidence(x) = d_second(x) - d_best(x)
 ```
 
-Low-confidence cells and states that contradict the underlying QR luminance
-class become erasures. They are never forced into payload symbols.
+Classification is restricted to the four states allowed by the already-known
+QR luminance bit. A cell becomes an erasure when either the best/second-best
+margin is too small or the absolute normalized distance from every allowed
+state is too large. Pilot patches use channel medians and the four spatial
+samples per state use a trimmed estimator, limiting glare sensitivity.
 
 ## 4. Inner Cauchy-MDS erasure code
 
@@ -187,9 +195,13 @@ the `u` missing data octets, and solves it with Gaussian elimination in
 u <= number of received parity octets
 ```
 
-All received parity is recomputed after recovery. An unmarked substitution is
-rejected by the parity check and CRC rather than silently accepted. This is an
-erasure decoder; it does not claim general unknown-error correction.
+All received parity is recomputed after recovery. If the first parity check
+fails, the decoder ranks codeword bytes by the minimum reliability of their
+four chroma cells and performs a bounded chase at erasure depths
+`{2,4,8,12,20,28,36,40}`. A hard substitution can therefore be recovered when
+it lies in the low-reliability set. This remains an erasure decoder with a
+soft-decision wrapper; it does not claim general algebraic unknown-error
+correction.
 
 ### 4.3 Erasure acceptance model
 
@@ -232,58 +244,41 @@ parity, frame profile, embedded mask ID, and CRC all agree.
 
 ## 6. Reading-speed controller
 
-### 6.1 Geometry tracking
+### 6.1 Handheld geometry policy
 
-Running a complete QR detector for every camera sample is wasteful on a stable
-handheld view. After a valid frame, the receiver caches the four QR corners and
-reuses the homography. It periodically relocks after `r` frames, where
-
-```text
-r in {1, 2, 3, 5}
-```
-
-Any MDS/CRC failure invalidates cached geometry immediately. Corner movement at
-the next detection updates an exponentially weighted motion-risk estimate.
+A frozen four-corner homography is not tracking. Even small handheld motion can
+move a sampled core into its guard or neighbor. `RX4` therefore runs QR
+acquisition on every processed camera frame (`r = 1`). Reuse will only return
+after an optical-flow or timing/alignment refinement implementation can update
+the corners between full detections.
 
 ### 6.2 Processing and acceptance model
 
-For target frame rate `f`, chroma decode time `t_c`, QR detection time `t_q`,
-and relock interval `r`, the processing-limited rate is
+For target frame rate `f`, chroma decode time `t_c`, and QR detection time
+`t_q`, the processing-limited rate is
 
 ```text
-f_effective = min(f, 1000 / (t_c + t_q/r))
+f_effective = min(f, 1000 / (t_c + t_q))
 ```
 
-Tracked-frame survival is modeled as
+The controller evaluates
 
 ```text
-P_track = exp(-motionRisk * (r-1))
-```
-
-and average geometry acceptance is
-
-```text
-P_geometry
-  = P_detect * (1 + (r-1)*P_track) / r
-```
-
-The controller evaluates every pair
-
-```text
-f in {6, 8, 10, 12, 15}
-r in {1, 2, 3, 5}
+f in {4, 6, 8, 10}
+r = 1
 ```
 
 and maximizes
 
 ```text
-eta(f,r)
-  = 174 * f_effective * P_geometry * P_inner / 41^2
+eta(f)
+  = 174 * f_effective * P_detect * P_inner / 45^2
 ```
 
-Measured QR time, chroma time, frame-detection rate, mean confidence, cell
-erasure rate, and corner motion are updated online. The selected FPS and relock
-interval directly control the camera loop.
+Measured QR time, chroma time, frame-detection rate, mean confidence, and cell
+erasure rate are updated online. The selected FPS directly controls the camera
+loop. Decoder diagnostics separately count finder, geometry, calibration,
+sampling, and inner-FEC failures so a rejected frame has a visible cause.
 
 ## 7. Measured implementation delta
 
@@ -292,7 +287,8 @@ On the same development machine and Node process, frame preparation measured:
 | Profile | Mean preparation | Compute ceiling | Notes |
 | --- | ---: | ---: | --- |
 | `MICROTECH2` | 328.72 ms | 3.04 FPS | dynamic V10 QR regenerated for 16 masks |
-| `JOINTMAX3` | 64.40 ms | 15.53 FPS | cached stable V5 QR, dynamic chroma only |
+| `JOINTMAX3` | 64.40 ms | 15.53 FPS | historical unguarded 2-module-margin profile |
+| `RX4` | pending device matrix | target 10 FPS | guarded chroma, 4-module acquisition, per-frame relock |
 
 This is a CPU preparation microbenchmark, not camera throughput. It establishes
 that the original encoder computation bottleneck was removed; real effective

@@ -1,13 +1,14 @@
 import {
   LAB_INNER_CODEWORD_BYTES,
   LAB_INNER_PARITY_BYTES,
-  LAB_MICRO_DERIVED_QUIET_MODULES,
+  LAB_ACTIVE_QUIET_MODULES,
   LAB_QR_MODULES,
   LAB_SOURCE_CHUNK_BYTES,
 } from "./optical-lab";
 
-const CANDIDATE_FPS = [6, 8, 10, 12, 15] as const;
-const CANDIDATE_RELOCK_INTERVALS = [1, 2, 3, 5] as const;
+const CANDIDATE_FPS = [4, 6, 8, 10] as const;
+// Reusing a frozen homography is unsafe on a handheld receiver without optical flow.
+const CANDIDATE_RELOCK_INTERVALS = [1] as const;
 
 export type ChannelEstimate = Readonly<{
   cellErasureRate: number;
@@ -41,7 +42,7 @@ export function optimizeCapturePolicy(observationInput: ChannelEstimate): Captur
     LAB_INNER_PARITY_BYTES,
     byteErasureRate,
   );
-  const symbolSide = LAB_QR_MODULES + (2 * LAB_MICRO_DERIVED_QUIET_MODULES);
+  const symbolSide = LAB_QR_MODULES + (2 * LAB_ACTIVE_QUIET_MODULES);
   const symbolArea = symbolSide ** 2;
   let selected: CapturePolicy | null = null;
 

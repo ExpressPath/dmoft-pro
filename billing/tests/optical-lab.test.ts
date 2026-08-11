@@ -3,19 +3,19 @@ import { describe, expect, it } from "vitest";
 import {
   C8_QR_PALETTE,
   DynamicLabDecoder,
+  LAB_ACTIVE_QUIET_MODULES,
+  LAB_COLOR_CORE_RATIO,
   LAB_CHROMA_RADIX,
   LAB_FRAME,
   LAB_INNER_CODE_RATE,
   LAB_INNER_CODEWORD_BYTES,
   LAB_INNER_PARITY_BYTES,
-  LAB_MICRO_DERIVED_QUIET_MODULES,
   LAB_OBJECT_BYTES,
   LAB_PACKET_BYTES,
   LAB_PALETTE_SIZE,
   LAB_PROFILE_AREA_GAIN,
   LAB_PROFILE_NAME,
   LAB_QR_MODULES,
-  LAB_QUIET_ZONE_AREA_GAIN,
   LAB_SOURCE_CHUNK_COUNT,
   LAB_SYMBOLS_PER_CODEWORD,
   LAB_VERIFIED_PAYLOAD_DENSITY_GAIN,
@@ -53,7 +53,7 @@ describe("integrated QR-family dynamic stream", () => {
     expect(LAB_OBJECT_BYTES).toBe(1392);
   });
 
-  it("uses one Version 5 QR matrix with Micro-derived margin and compact pilots", () => {
+  it("uses one Version 5 QR matrix with a robust margin and compact pilots", () => {
     const { matrix } = PREPARED;
     const reservedCount = Array.from(matrix.reserved).filter(Boolean).length;
     const globalPilots = matrix.pilots.filter((pilot) => pilot.scope === "global");
@@ -74,11 +74,11 @@ describe("integrated QR-family dynamic stream", () => {
     expect(localPilots).toHaveLength(44);
     expect(matrix.pilots).toHaveLength(76);
     expect(matrix.payloadCells).toHaveLength(1003);
-    expect(LAB_FRAME.quietModules).toBe(LAB_MICRO_DERIVED_QUIET_MODULES);
-    expect(LAB_FRAME.width).toBe((LAB_QR_MODULES + (2 * LAB_MICRO_DERIVED_QUIET_MODULES)) * LAB_FRAME.modulePitch);
-    expect(LAB_QUIET_ZONE_AREA_GAIN).toBeGreaterThan(1.13);
-    expect(LAB_PROFILE_AREA_GAIN).toBeGreaterThan(2.2);
-    expect(LAB_VERIFIED_PAYLOAD_DENSITY_GAIN).toBeGreaterThan(1.5);
+    expect(LAB_FRAME.quietModules).toBe(LAB_ACTIVE_QUIET_MODULES);
+    expect(LAB_FRAME.width).toBe((LAB_QR_MODULES + (2 * LAB_ACTIVE_QUIET_MODULES)) * LAB_FRAME.modulePitch);
+    expect(LAB_COLOR_CORE_RATIO).toBeGreaterThanOrEqual(0.7);
+    expect(LAB_PROFILE_AREA_GAIN).toBeGreaterThan(1.8);
+    expect(LAB_VERIFIED_PAYLOAD_DENSITY_GAIN).toBeGreaterThan(1.24);
     expect(LAB_INNER_CODEWORD_BYTES).toBe(250);
     expect(LAB_INNER_PARITY_BYTES).toBe(40);
     expect(LAB_INNER_CODE_RATE).toBeCloseTo(0.84, 8);
@@ -130,6 +130,7 @@ describe("integrated QR-family dynamic stream", () => {
     expect(decoded.frame.frameKind).toBe("systematic");
     expect(decoded.repairMode).toBe("cauchy-mds-erasure");
     expect(decoded.correctedByteErasures).toBe(0);
+    expect(decoded.reliabilityErasedBytes).toBe(0);
     expect(decoded.inferredMaskId).toBe(PREPARED.frame.maskId);
   });
 
@@ -163,6 +164,26 @@ describe("integrated QR-family dynamic stream", () => {
       PREPARED.matrix,
       PREPARED.frame.maskId,
     )).toThrow("valid MDS");
+  });
+
+  it("recovers low-reliability hard substitutions with a bounded erasure chase", () => {
+    const observed: Array<number | null> = PREPARED.matrix.payloadCells.map((cell) => PREPARED.paletteStates[cell.index]);
+    const reliabilities = new Array<number>(observed.length).fill(100);
+    for (let symbol = 0; symbol < 4; symbol += 1) {
+      const original = observed[40 + symbol] as number;
+      observed[40 + symbol] = (original < 4 ? 0 : 4) + (((original % 4) + 1) % 4);
+      reliabilities[40 + symbol] = 0.01;
+    }
+
+    const decoded = decodeIntegratedPaletteSymbols(
+      observed,
+      PREPARED.matrix,
+      PREPARED.frame.maskId,
+      reliabilities,
+    );
+
+    expect(decoded.frame.sequence).toBe(PREPARED.frame.sequence);
+    expect(decoded.reliabilityErasedBytes).toBe(2);
   });
 
   it("rejects byte erasures beyond the forty-byte inner budget", () => {

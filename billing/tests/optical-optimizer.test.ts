@@ -3,7 +3,7 @@ import { describe, expect, it } from "vitest";
 import { estimateMdsSuccessProbability, optimizeCapturePolicy } from "../src/lib/optical-optimizer";
 
 describe("joint optical capture optimizer", () => {
-  it("selects the smallest relock interval that sustains maximum FPS on a stable channel", () => {
+  it("keeps handheld geometry locked to every observed frame", () => {
     const policy = optimizeCapturePolicy({
       cellErasureRate: 0.005,
       frameDetectionRate: 0.99,
@@ -13,11 +13,11 @@ describe("joint optical capture optimizer", () => {
       motionRisk: 0.002,
     });
 
-    expect(policy.targetFps).toBe(15);
-    expect(policy.geometryRelockInterval).toBe(2);
+    expect(policy.targetFps).toBe(10);
+    expect(policy.geometryRelockInterval).toBe(1);
     expect(policy.erasureThreshold).toBe(1.5);
     expect(policy.estimatedInnerSuccess).toBeGreaterThan(0.999);
-    expect(policy.verifiedBytesPerSecond).toBeGreaterThan(2400);
+    expect(policy.verifiedBytesPerSecond).toBeGreaterThan(1600);
   });
 
   it("relocks every frame when motion makes cached geometry unsafe", () => {

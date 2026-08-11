@@ -6,26 +6,25 @@ export const LAB_QR_VERSION = 5;
 export const LAB_QR_MODULES = 17 + (4 * LAB_QR_VERSION);
 export const LAB_QR_ERROR_CORRECTION = "H" as const;
 export const LAB_STANDARD_QR_QUIET_MODULES = 4;
-export const LAB_MICRO_DERIVED_QUIET_MODULES = 2;
-export const LAB_QUIET_ZONE_AREA_GAIN = (
-  (LAB_QR_MODULES + (2 * LAB_STANDARD_QR_QUIET_MODULES))
-  / (LAB_QR_MODULES + (2 * LAB_MICRO_DERIVED_QUIET_MODULES))
-) ** 2;
+export const LAB_ACTIVE_QUIET_MODULES = LAB_STANDARD_QR_QUIET_MODULES;
+// A 14/16 core preserves a one-pixel luminance guard while remaining decodable
+// by the QR acquisition plane. Smaller cores fragmented the QR data modules.
+export const LAB_COLOR_CORE_RATIO = 0.875;
 export const LAB_FRAME = {
-  width: 656,
-  height: 656,
-  qrX: 32,
-  qrY: 32,
+  width: 720,
+  height: 720,
+  qrX: 64,
+  qrY: 64,
   qrSize: 592,
   modulePitch: 16,
   moduleCount: LAB_QR_MODULES,
-  quietModules: LAB_MICRO_DERIVED_QUIET_MODULES,
+  quietModules: LAB_ACTIVE_QUIET_MODULES,
   tileSize: 8,
 } as const;
 
-export const LAB_PROFILE_NAME = "PRISM-C8-QR-JOINTMAX3";
+export const LAB_PROFILE_NAME = "PRISM-C8-QR-RX4";
 export const LAB_BOOTSTRAP_PATH = "/o";
-export const LAB_TARGET_FPS = 15;
+export const LAB_TARGET_FPS = 10;
 export const LAB_PALETTE_SIZE = 8;
 export const LAB_CHROMA_RADIX = 4;
 export const LAB_PACKET_BYTES = 210;
@@ -37,14 +36,14 @@ export const LAB_SOURCE_CHUNK_COUNT = 8;
 export const LAB_OBJECT_BYTES = LAB_SOURCE_CHUNK_BYTES * LAB_SOURCE_CHUNK_COUNT;
 export const LAB_SYMBOLS_PER_CODEWORD = LAB_INNER_CODEWORD_BYTES * 4;
 export const LAB_ERASURE_THRESHOLD = 2;
-export const LAB_GEOMETRY_RELOCK_INTERVAL = 5;
+export const LAB_GEOMETRY_RELOCK_INTERVAL = 1;
 export const LAB_PREVIOUS_PROFILE_TOTAL_MODULES = 61;
 export const LAB_PREVIOUS_SOURCE_CHUNK_BYTES = 256;
 export const LAB_PROFILE_AREA_GAIN = (LAB_PREVIOUS_PROFILE_TOTAL_MODULES / (
-  LAB_QR_MODULES + (2 * LAB_MICRO_DERIVED_QUIET_MODULES)
+  LAB_QR_MODULES + (2 * LAB_ACTIVE_QUIET_MODULES)
 )) ** 2;
 export const LAB_VERIFIED_PAYLOAD_DENSITY_GAIN = (
-  LAB_SOURCE_CHUNK_BYTES / ((LAB_QR_MODULES + (2 * LAB_MICRO_DERIVED_QUIET_MODULES)) ** 2)
+  LAB_SOURCE_CHUNK_BYTES / ((LAB_QR_MODULES + (2 * LAB_ACTIVE_QUIET_MODULES)) ** 2)
 ) / (
   LAB_PREVIOUS_SOURCE_CHUNK_BYTES / (LAB_PREVIOUS_PROFILE_TOTAL_MODULES ** 2)
 );
@@ -107,6 +106,7 @@ export type SoftClassification = Readonly<{
   symbol: number;
   secondSymbol: number;
   confidence: number;
+  bestDistance: number;
   erasure: boolean;
 }>;
 
@@ -140,6 +140,7 @@ export type FrameGridDecode = Readonly<{
   frame: DynamicLabFrame;
   repairMode: "cauchy-mds-erasure";
   correctedByteErasures: number;
+  reliabilityErasedBytes: number;
   inferredMaskId: number;
 }>;
 
@@ -388,6 +389,7 @@ export function decodeIntegratedPaletteSymbols(
   observedPaletteStates: readonly (number | null)[],
   matrix: IntegratedQrMatrix,
   knownMaskId?: number,
+  symbolReliabilities?: readonly number[],
 ): FrameGridDecode {
   if (observedPaletteStates.length < LAB_SYMBOLS_PER_CODEWORD) {
     throw new Error("not enough integrated chroma symbols for the inner codeword");
@@ -402,24 +404,38 @@ export function decodeIntegratedPaletteSymbols(
   const candidates = knownMaskId === undefined
     ? Array.from({ length: 16 }, (_, maskId) => maskId)
     : [knownMaskId];
+  const preparedCandidates = candidates.map((maskId) => {
+    const symbols = removeChromaMask(constrainedSymbols, maskId, matrix.payloadCells)
+      .slice(0, LAB_SYMBOLS_PER_CODEWORD);
+    return { maskId, codeword: decodeQuaternaryToOptionalBytes(symbols) };
+  });
+  const referenceCodeword = preparedCandidates[0].codeword;
+  const baseErasures = referenceCodeword.reduce<number>((count, value) => count + (value === null ? 1 : 0), 0);
+  const reliabilityOrder = buildByteReliabilityOrder(symbolReliabilities, referenceCodeword);
+  const chaseCounts = reliabilityOrder.length === 0
+    ? [0]
+    : reliabilityChaseCounts(Math.max(0, LAB_INNER_PARITY_BYTES - baseErasures), reliabilityOrder.length);
   const valid: FrameGridDecode[] = [];
-  for (const maskId of candidates) {
-    try {
-      const symbols = removeChromaMask(constrainedSymbols, maskId, matrix.payloadCells)
-        .slice(0, LAB_SYMBOLS_PER_CODEWORD);
-      const codeword = decodeQuaternaryToOptionalBytes(symbols);
-      const decoded = decodeCauchyMds(codeword, LAB_PACKET_BYTES);
-      const frame = parseDynamicFrame(decoded.data);
-      if (frame.maskId !== maskId) continue;
-      valid.push({
-        frame,
-        repairMode: "cauchy-mds-erasure",
-        correctedByteErasures: decoded.recoveredDataErasures,
-        inferredMaskId: maskId,
-      });
-    } catch {
-      // Wrong masks and codewords outside the erasure budget are rejected.
+  for (const chaseCount of chaseCounts) {
+    for (const { maskId, codeword: baseCodeword } of preparedCandidates) {
+      try {
+        const codeword = baseCodeword.slice();
+        for (let index = 0; index < chaseCount; index += 1) codeword[reliabilityOrder[index]] = null;
+        const decoded = decodeCauchyMds(codeword, LAB_PACKET_BYTES);
+        const frame = parseDynamicFrame(decoded.data);
+        if (frame.maskId !== maskId) continue;
+        valid.push({
+          frame,
+          repairMode: "cauchy-mds-erasure",
+          correctedByteErasures: decoded.recoveredDataErasures,
+          reliabilityErasedBytes: chaseCount,
+          inferredMaskId: maskId,
+        });
+      } catch {
+        // Try the next chroma mask or reliability-guided erasure depth.
+      }
     }
+    if (valid.length > 0) break;
   }
   if (valid.length === 0) throw new Error("no chroma mask produced a valid MDS and CRC32 frame");
   const decoded = valid[0];
@@ -553,7 +569,7 @@ export function estimatePalette(samples: readonly (readonly Rgb[])[]): PaletteMo
   if (samples.length !== LAB_PALETTE_SIZE || samples.some((group) => group.length === 0)) {
     throw new Error("all eight integrated palette states need observed samples");
   }
-  const means = samples.map((group) => meanRgb(group));
+  const means = samples.map((group) => robustMeanRgb(group));
   for (let first = 0; first < means.length; first += 1) {
     for (let second = first + 1; second < means.length; second += 1) {
       if (deltaE(means[first], means[second]) < 18) throw new Error("observed integrated palette separation is too low");
@@ -594,6 +610,7 @@ export function classifyColor(
   observed: Rgb,
   model: PaletteModel,
   erasureThreshold = LAB_ERASURE_THRESHOLD,
+  expectedDark?: boolean,
 ): SoftClassification {
   if (!Number.isFinite(erasureThreshold) || erasureThreshold < 0) throw new Error("erasure threshold must be non-negative");
   const ranked = model.means.map((mean, symbol) => {
@@ -602,13 +619,16 @@ export function classifyColor(
       distance += ((observed[channel] - mean[channel]) ** 2) * model.inverseVariances[symbol][channel];
     }
     return { symbol, distance };
-  }).sort((left, right) => left.distance - right.distance);
+  }).filter(({ symbol }) => expectedDark === undefined || isDarkPaletteState(symbol) === expectedDark)
+    .sort((left, right) => left.distance - right.distance);
+  if (ranked.length < 2) throw new Error("color classifier needs at least two candidate states");
   const confidence = ranked[1].distance - ranked[0].distance;
   return {
     symbol: ranked[0].symbol,
     secondSymbol: ranked[1].symbol,
     confidence,
-    erasure: confidence < erasureThreshold,
+    bestDistance: ranked[0].distance,
+    erasure: confidence < erasureThreshold || ranked[0].distance > 36,
   };
 }
 
@@ -873,6 +893,35 @@ function chromaMaskDelta(maskId: number, row: number, column: number): number {
   }
 }
 
+function buildByteReliabilityOrder(
+  symbolReliabilities: readonly number[] | undefined,
+  codeword: readonly (number | null)[],
+): number[] {
+  if (!symbolReliabilities) return [];
+  if (symbolReliabilities.length < LAB_SYMBOLS_PER_CODEWORD) {
+    throw new Error("soft reliability vector is shorter than the inner codeword");
+  }
+  return Array.from({ length: codeword.length }, (_, byteIndex) => {
+    const offset = byteIndex * 4;
+    const reliability = Math.min(
+      symbolReliabilities[offset],
+      symbolReliabilities[offset + 1],
+      symbolReliabilities[offset + 2],
+      symbolReliabilities[offset + 3],
+    );
+    return { byteIndex, reliability };
+  }).filter(({ byteIndex, reliability }) => codeword[byteIndex] !== null && Number.isFinite(reliability))
+    .sort((left, right) => left.reliability - right.reliability || left.byteIndex - right.byteIndex)
+    .map(({ byteIndex }) => byteIndex);
+}
+
+function reliabilityChaseCounts(budget: number, available: number): number[] {
+  if (budget <= 0 || available <= 0) return [0];
+  const limit = Math.min(budget, available);
+  return Array.from(new Set([0, 2, 4, 8, 12, 20, 28, 36, limit].filter((count) => count <= limit)))
+    .sort((left, right) => left - right);
+}
+
 function assertSessionNonce(sessionNonce: Uint8Array) {
   if (sessionNonce.length !== 8) throw new Error("lab session nonce must be exactly 8 bytes");
 }
@@ -928,11 +977,14 @@ function modulo(value: number, modulus: number): number {
   return ((value % modulus) + modulus) % modulus;
 }
 
-function meanRgb(samples: readonly Rgb[]): Rgb {
-  const totals = samples.reduce<[number, number, number]>((sum, rgb) => [
-    sum[0] + rgb[0], sum[1] + rgb[1], sum[2] + rgb[2],
-  ], [0, 0, 0]);
-  return totals.map((total) => total / samples.length) as [number, number, number];
+function robustMeanRgb(samples: readonly Rgb[]): Rgb {
+  if (samples.length === 0) throw new Error("cannot estimate a color from zero samples");
+  return [0, 1, 2].map((channel) => {
+    const sorted = samples.map((sample) => sample[channel]).sort((left, right) => left - right);
+    const trim = sorted.length >= 4 ? 1 : 0;
+    const central = sorted.slice(trim, sorted.length - trim);
+    return central.reduce((sum, value) => sum + value, 0) / central.length;
+  }) as [number, number, number];
 }
 
 function toHex(bytes: Uint8Array): string {
