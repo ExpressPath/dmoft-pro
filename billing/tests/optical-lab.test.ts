@@ -103,6 +103,16 @@ describe("integrated QR-family dynamic stream", () => {
     expect(lightMinimum - darkMaximum).toBeGreaterThan(0.25);
   });
 
+  it("keeps chromatic states nearly iso-luminant inside each QR carrier class", () => {
+    const cameraLuma = ([red, green, blue]: Rgb) => (0.299 * red) + (0.587 * green) + (0.114 * blue);
+    const darkChromatic = C8_QR_PALETTE.slice(1, 4).map(cameraLuma);
+    const lightChromatic = C8_QR_PALETTE.slice(5, 8).map(cameraLuma);
+
+    expect(Math.max(...darkChromatic) - Math.min(...darkChromatic)).toBeLessThan(8);
+    expect(Math.max(...lightChromatic) - Math.min(...lightChromatic)).toBeLessThan(8);
+    expect(Math.min(...lightChromatic) - Math.max(...darkChromatic)).toBeGreaterThan(160);
+  });
+
   it("round-trips frame bytes through two-bit chroma symbols", () => {
     const bytes = new Uint8Array(LAB_PACKET_BYTES);
     for (let index = 0; index < bytes.length; index += 1) bytes[index] = (index * 73 + 19) & 0xff;

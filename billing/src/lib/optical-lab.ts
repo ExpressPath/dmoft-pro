@@ -22,9 +22,15 @@ export const LAB_FRAME = {
   tileSize: 8,
 } as const;
 
-export const LAB_PROFILE_NAME = "PRISM-C8-QR-RX4";
+export const LAB_PROFILE_NAME = "PRISM-C8-QR-RX5";
 export const LAB_BOOTSTRAP_PATH = "/o";
 export const LAB_TARGET_FPS = 10;
+// One monochrome control-plane frame is inserted before every four chroma
+// payload frames. It gives mobile QR engines a clean reacquisition point while
+// the payload remains a single, area-efficient QR-family symbol.
+export const LAB_ACQUISITION_BEACON_INTERVAL = 4;
+export const LAB_GEOMETRY_TRACK_MAX_FRAMES = 3;
+export const LAB_GEOMETRY_TRACK_MAX_AGE_MS = 360;
 export const LAB_PALETTE_SIZE = 8;
 export const LAB_CHROMA_RADIX = 4;
 export const LAB_PACKET_BYTES = 210;
@@ -51,13 +57,13 @@ export const LAB_VERIFIED_PAYLOAD_DENSITY_GAIN = (
 // States 0-3 must remain below the QR luminance threshold; states 4-7 must remain above it.
 export const C8_QR_PALETTE = [
   [0, 0, 0],
-  [195, 20, 25],
-  [0, 115, 45],
-  [25, 55, 190],
+  [180, 0, 0],
+  [0, 90, 0],
+  [30, 30, 190],
   [255, 255, 255],
-  [250, 225, 20],
-  [35, 215, 225],
-  [245, 135, 225],
+  [250, 245, 15],
+  [150, 250, 255],
+  [255, 210, 245],
 ] as const;
 
 const PACKET_MAGIC = new Uint8Array([0x44, 0x4d, 0x4f, 0x46]);

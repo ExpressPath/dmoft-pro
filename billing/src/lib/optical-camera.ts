@@ -1,3 +1,5 @@
+import jsQR from "jsqr";
+
 import {
   LAB_CHROMA_RADIX,
   LAB_ERASURE_THRESHOLD,
@@ -31,6 +33,14 @@ export type QrLocation = Readonly<{
   bottomLeftCorner: Point;
 }>;
 
+export type QrAcquisitionMode = "center-raw" | "center-carrier" | "full-raw" | "full-carrier";
+
+export type QrAcquisition = Readonly<{
+  data: string;
+  location: QrLocation;
+  mode: QrAcquisitionMode;
+}>;
+
 export type OpticalDecodeStage = "geometry" | "bootstrap" | "calibration" | "sampling" | "inner-fec";
 
 export class OpticalDecodeError extends Error {
@@ -58,6 +68,65 @@ const QR_SOURCE_CORNERS: readonly Point[] = [
   { x: LAB_FRAME.qrX + LAB_FRAME.qrSize, y: LAB_FRAME.qrY + LAB_FRAME.qrSize },
   { x: LAB_FRAME.qrX, y: LAB_FRAME.qrY + LAB_FRAME.qrSize },
 ];
+
+const CENTER_SEARCH_RATIO = 0.96;
+
+/**
+ * Locates and decodes the monochrome QR control plane without assuming that
+ * camera RGB values preserve the display's grayscale luminance. The centered
+ * attempts match the on-screen camera guide and reduce both search noise and
+ * latency. The max-channel carrier projection is a fallback for saturated
+ * chroma states whose ordinary grayscale values cross a QR threshold.
+ */
+export function acquireQr(image: CameraPixelImage): QrAcquisition | null {
+  validateImage(image);
+  const center = centeredSquare(image, CENTER_SEARCH_RATIO);
+  const attempts: ReadonlyArray<Readonly<{
+    source: CameraPixelImage;
+    carrier: boolean;
+    offsetX: number;
+    offsetY: number;
+    mode: QrAcquisitionMode;
+  }>> = [
+    {
+      source: center.image,
+      carrier: false,
+      offsetX: center.offsetX,
+      offsetY: center.offsetY,
+      mode: "center-raw",
+    },
+    {
+      source: center.image,
+      carrier: true,
+      offsetX: center.offsetX,
+      offsetY: center.offsetY,
+      mode: "center-carrier",
+    },
+    { source: image, carrier: false, offsetX: 0, offsetY: 0, mode: "full-raw" },
+    { source: image, carrier: true, offsetX: 0, offsetY: 0, mode: "full-carrier" },
+  ];
+
+  const seen = new Set<string>();
+  for (const attempt of attempts) {
+    const key = `${attempt.source.width}:${attempt.source.height}:${attempt.carrier ? "carrier" : "raw"}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    const attemptImage = attempt.carrier ? projectColorCarrier(attempt.source) : attempt.source;
+    const pixels = attemptImage.data instanceof Uint8ClampedArray
+      ? attemptImage.data
+      : Uint8ClampedArray.from(attemptImage.data);
+    const qr = jsQR(pixels, attemptImage.width, attemptImage.height, {
+      inversionAttempts: "dontInvert",
+    });
+    if (!qr) continue;
+    return {
+      data: qr.data,
+      location: offsetLocation(qr.location as QrLocation, attempt.offsetX, attempt.offsetY),
+      mode: attempt.mode,
+    };
+  }
+  return null;
+}
 
 export function decodeCameraImage(
   image: CameraPixelImage,
@@ -203,6 +272,107 @@ function sampleRgb(image: CameraPixelImage, point: Point, radius: number): Rgb {
     }
   }
   return [median(red), median(green), median(blue)];
+}
+
+function centeredSquare(image: CameraPixelImage, ratio: number): Readonly<{
+  image: CameraPixelImage;
+  offsetX: number;
+  offsetY: number;
+}> {
+  const size = Math.max(1, Math.floor(Math.min(image.width, image.height) * ratio));
+  if (size === image.width && size === image.height) return { image, offsetX: 0, offsetY: 0 };
+  const offsetX = Math.floor((image.width - size) / 2);
+  const offsetY = Math.floor((image.height - size) / 2);
+  const data = new Uint8ClampedArray(size * size * 4);
+  for (let y = 0; y < size; y += 1) {
+    const sourceStart = (((offsetY + y) * image.width) + offsetX) * 4;
+    data.set(image.data.subarray(sourceStart, sourceStart + (size * 4)), y * size * 4);
+  }
+  return { image: { data, width: size, height: size }, offsetX, offsetY };
+}
+
+function projectColorCarrier(image: CameraPixelImage): CameraPixelImage {
+  const data = new Uint8ClampedArray(image.data.length);
+  const channelCeilings = estimateChannelCeilings(image);
+  const carrierValues = new Uint8Array(image.width * image.height);
+  const histogram = new Uint32Array(256);
+  let pixel = 0;
+  for (let offset = 0; offset < image.data.length; offset += 4) {
+    const carrier = Math.max(
+      image.data[offset] / channelCeilings[0],
+      image.data[offset + 1] / channelCeilings[1],
+      image.data[offset + 2] / channelCeilings[2],
+    );
+    const value = Math.max(0, Math.min(255, Math.round(carrier * 255)));
+    carrierValues[pixel] = value;
+    histogram[value] += 1;
+    pixel += 1;
+  }
+  // The profile constrains dark chroma peaks to <= 0.76 and light chroma
+  // peaks to >= 0.88 after per-channel normalization. Clamp Otsu inside that
+  // intentional guard band so black finder mass cannot pull the split to zero.
+  const threshold = Math.max(196, Math.min(220, otsuThreshold(histogram, carrierValues.length)));
+  for (let index = 0; index < carrierValues.length; index += 1) {
+    const offset = index * 4;
+    const value = carrierValues[index] <= threshold ? 0 : 255;
+    data[offset] = value;
+    data[offset + 1] = value;
+    data[offset + 2] = value;
+    data[offset + 3] = 255;
+  }
+  return { data, width: image.width, height: image.height };
+}
+
+function otsuThreshold(histogram: Uint32Array, total: number): number {
+  let weightedTotal = 0;
+  for (let value = 0; value < histogram.length; value += 1) weightedTotal += value * histogram[value];
+  let backgroundWeight = 0;
+  let backgroundWeighted = 0;
+  let bestVariance = -1;
+  let bestThreshold = 127;
+  for (let threshold = 0; threshold < histogram.length - 1; threshold += 1) {
+    backgroundWeight += histogram[threshold];
+    if (backgroundWeight === 0) continue;
+    const foregroundWeight = total - backgroundWeight;
+    if (foregroundWeight === 0) break;
+    backgroundWeighted += threshold * histogram[threshold];
+    const backgroundMean = backgroundWeighted / backgroundWeight;
+    const foregroundMean = (weightedTotal - backgroundWeighted) / foregroundWeight;
+    const variance = backgroundWeight * foregroundWeight * ((backgroundMean - foregroundMean) ** 2);
+    if (variance > bestVariance) {
+      bestVariance = variance;
+      bestThreshold = threshold;
+    }
+  }
+  return bestThreshold;
+}
+
+function estimateChannelCeilings(image: CameraPixelImage): Rgb {
+  const histograms = Array.from({ length: 3 }, () => new Uint32Array(256));
+  for (let offset = 0; offset < image.data.length; offset += 4) {
+    histograms[0][image.data[offset]] += 1;
+    histograms[1][image.data[offset + 1]] += 1;
+    histograms[2][image.data[offset + 2]] += 1;
+  }
+  const target = Math.max(1, Math.ceil(image.width * image.height * 0.98));
+  return histograms.map((histogram) => {
+    let cumulative = 0;
+    for (let value = 0; value < histogram.length; value += 1) {
+      cumulative += histogram[value];
+      if (cumulative >= target) return Math.max(32, value);
+    }
+    return 255;
+  }) as [number, number, number];
+}
+
+function offsetLocation(location: QrLocation, offsetX: number, offsetY: number): QrLocation {
+  const offset = (point: Point): Point => ({ x: point.x + offsetX, y: point.y + offsetY });
+  return {
+    topLeftCorner: offset(location.topLeftCorner),
+    topRightCorner: offset(location.topRightCorner),
+    bottomRightCorner: offset(location.bottomRightCorner),
+    bottomLeftCorner: offset(location.bottomLeftCorner),
+  };
 }
 
 function median(values: number[]): number {

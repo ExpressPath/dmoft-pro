@@ -1,6 +1,6 @@
 # Prism Joint-Max Dynamic Color QR
 
-Status: experimental browser profile (`PRISM-C8-QR-RX4`)
+Status: experimental browser profile (`PRISM-C8-QR-RX5`)
 
 This document specifies the implemented optimization that jointly improves
 area efficiency, inner error recovery, and reading speed. It distinguishes
@@ -40,7 +40,7 @@ The previous profile embedded session, sequence, and mask metadata in the QR
 URL. That forced a Version 10/H luminance matrix and regenerated a different QR
 matrix for every mask candidate and every frame.
 
-`RX4` keeps dynamic control inside the protected chroma packet. The QR
+`RX5` keeps dynamic control inside the protected chroma packet. The QR
 luminance plane is the constant same-origin URL:
 
 ```text
@@ -244,13 +244,48 @@ parity, frame profile, embedded mask ID, and CRC all agree.
 
 ## 6. Reading-speed controller
 
-### 6.1 Handheld geometry policy
+### 6.1 Multi-path acquisition and handheld geometry policy
 
-A frozen four-corner homography is not tracking. Even small handheld motion can
-move a sampled core into its guard or neighbor. `RX4` therefore runs QR
-acquisition on every processed camera frame (`r = 1`). Reuse will only return
-after an optical-flow or timing/alignment refinement implementation can update
-the corners between full detections.
+A failed full QR decode does not prove that the finder patterns are absent.
+The failure may occur later in extraction, luminance classification, QR
+Reed-Solomon recovery, or bootstrap parsing. `RX5` therefore reports QR
+bootstrap acquisition separately from chroma and inner-FEC stages.
+
+Each relock evaluates the following acquisition chain:
+
+```text
+native mobile QR detector (when available)
+  -> centered raw RGB/grayscale QR decode
+  -> centered normalized max-channel carrier decode
+  -> full-frame raw decode
+  -> full-frame normalized max-channel carrier decode
+  -> bounded reuse of the last authenticated bootstrap geometry
+```
+
+The centered search matches the visible camera guide. The carrier projection
+first normalizes each RGB channel at its observed 98th percentile and computes
+
+```text
+v(x) = max(R/R_98, G/G_98, B/B_98)
+```
+
+The RX5 palette constrains chromatic dark-state peaks below the carrier guard
+band and chromatic light-state peaks above it. The projection threshold is
+therefore clamped inside that deliberately empty band rather than being allowed
+to collapse toward the large black finder population.
+
+A frozen four-corner homography is not long-term tracking. However, discarding
+a valid location after one transition frame also destroys synchronization.
+RX5 reuses a detected location for at most three processed frames and 360 ms.
+Geometry or sampling failures invalidate it immediately. This is short enough
+to bound handheld drift while bridging an exposure that overlaps a color
+transition.
+
+The sender also inserts one pure monochrome acquisition beacon before every
+four chroma payload frames. The beacon occupies the same Version 5 QR symbol;
+it is temporal control-plane redundancy, not a second code or extra screen
+region. Sequence numbers advance only on payload frames, so a beacon cannot
+silently consume a source or repair symbol.
 
 ### 6.2 Processing and acceptance model
 
@@ -265,7 +300,7 @@ The controller evaluates
 
 ```text
 f in {4, 6, 8, 10}
-r = 1
+r = 1, with bounded 3-frame / 360-ms geometry reuse after a missed relock
 ```
 
 and maximizes
@@ -288,7 +323,8 @@ On the same development machine and Node process, frame preparation measured:
 | --- | ---: | ---: | --- |
 | `MICROTECH2` | 328.72 ms | 3.04 FPS | dynamic V10 QR regenerated for 16 masks |
 | `JOINTMAX3` | 64.40 ms | 15.53 FPS | historical unguarded 2-module-margin profile |
-| `RX4` | pending device matrix | target 10 FPS | guarded chroma, 4-module acquisition, per-frame relock |
+| `RX4` | pending device matrix | target 10 FPS | guarded chroma, 4-module acquisition, destructive relock failure |
+| `RX5` | pending device matrix | target 10 display FPS | iso-luminant chroma, 1:4 monochrome beacon, native/carrier fallback, bounded tracking |
 
 This is a CPU preparation microbenchmark, not camera throughput. It establishes
 that the original encoder computation bottleneck was removed; real effective
