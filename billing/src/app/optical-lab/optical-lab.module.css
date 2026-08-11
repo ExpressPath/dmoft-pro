@@ -116,7 +116,7 @@
 
 .senderCanvas {
   display: block;
-  width: min(100%, 732px);
+  width: min(100%, 656px);
   height: auto;
   margin-inline: auto;
   background: #fff;

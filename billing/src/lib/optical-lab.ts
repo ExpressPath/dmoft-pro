@@ -1,6 +1,8 @@
 import QRCode from "qrcode";
 
-export const LAB_QR_VERSION = 10;
+import { decodeCauchyMds, encodeCauchyMds } from "./cauchy-erasure";
+
+export const LAB_QR_VERSION = 5;
 export const LAB_QR_MODULES = 17 + (4 * LAB_QR_VERSION);
 export const LAB_QR_ERROR_CORRECTION = "H" as const;
 export const LAB_STANDARD_QR_QUIET_MODULES = 4;
@@ -10,29 +12,42 @@ export const LAB_QUIET_ZONE_AREA_GAIN = (
   / (LAB_QR_MODULES + (2 * LAB_MICRO_DERIVED_QUIET_MODULES))
 ) ** 2;
 export const LAB_FRAME = {
-  width: 732,
-  height: 732,
-  qrX: 24,
-  qrY: 24,
-  qrSize: 684,
-  modulePitch: 12,
+  width: 656,
+  height: 656,
+  qrX: 32,
+  qrY: 32,
+  qrSize: 592,
+  modulePitch: 16,
   moduleCount: LAB_QR_MODULES,
   quietModules: LAB_MICRO_DERIVED_QUIET_MODULES,
   tileSize: 8,
 } as const;
 
-export const LAB_PROFILE_NAME = "PRISM-C8-QR-MICROTECH2";
-export const LAB_BOOTSTRAP_PREFIX = "PRISM-IQR2";
-export const LAB_TARGET_FPS = 8;
+export const LAB_PROFILE_NAME = "PRISM-C8-QR-JOINTMAX3";
+export const LAB_BOOTSTRAP_PATH = "/o";
+export const LAB_TARGET_FPS = 15;
 export const LAB_PALETTE_SIZE = 8;
 export const LAB_CHROMA_RADIX = 4;
-export const LAB_PACKET_BYTES = 320;
-export const LAB_PACKET_COPIES = 2;
-export const LAB_SOURCE_CHUNK_BYTES = 256;
+export const LAB_PACKET_BYTES = 210;
+export const LAB_INNER_PARITY_BYTES = 40;
+export const LAB_INNER_CODEWORD_BYTES = LAB_PACKET_BYTES + LAB_INNER_PARITY_BYTES;
+export const LAB_INNER_CODE_RATE = LAB_PACKET_BYTES / LAB_INNER_CODEWORD_BYTES;
+export const LAB_SOURCE_CHUNK_BYTES = 174;
 export const LAB_SOURCE_CHUNK_COUNT = 8;
 export const LAB_OBJECT_BYTES = LAB_SOURCE_CHUNK_BYTES * LAB_SOURCE_CHUNK_COUNT;
-export const LAB_SYMBOLS_PER_PACKET = LAB_PACKET_BYTES * 4;
+export const LAB_SYMBOLS_PER_CODEWORD = LAB_INNER_CODEWORD_BYTES * 4;
 export const LAB_ERASURE_THRESHOLD = 2;
+export const LAB_GEOMETRY_RELOCK_INTERVAL = 5;
+export const LAB_PREVIOUS_PROFILE_TOTAL_MODULES = 61;
+export const LAB_PREVIOUS_SOURCE_CHUNK_BYTES = 256;
+export const LAB_PROFILE_AREA_GAIN = (LAB_PREVIOUS_PROFILE_TOTAL_MODULES / (
+  LAB_QR_MODULES + (2 * LAB_MICRO_DERIVED_QUIET_MODULES)
+)) ** 2;
+export const LAB_VERIFIED_PAYLOAD_DENSITY_GAIN = (
+  LAB_SOURCE_CHUNK_BYTES / ((LAB_QR_MODULES + (2 * LAB_MICRO_DERIVED_QUIET_MODULES)) ** 2)
+) / (
+  LAB_PREVIOUS_SOURCE_CHUNK_BYTES / (LAB_PREVIOUS_PROFILE_TOTAL_MODULES ** 2)
+);
 
 // States 0-3 must remain below the QR luminance threshold; states 4-7 must remain above it.
 export const C8_QR_PALETTE = [
@@ -48,14 +63,15 @@ export const C8_QR_PALETTE = [
 
 const PACKET_MAGIC = new Uint8Array([0x44, 0x4d, 0x4f, 0x46]);
 const OBJECT_MAGIC = new Uint8Array([0x50, 0x47, 0x44, 0x4f]);
-const FRAME_VERSION = 4;
-const C8_MICROTECH_PROFILE_CODE = 9;
+const FRAME_VERSION = 5;
+const C8_JOINT_MAX_PROFILE_CODE = 10;
 const OUTER_XOR_CODE = 1;
 const FRAME_PAYLOAD_OFFSET = 32;
 const FRAME_CRC_OFFSET = LAB_PACKET_BYTES - 4;
 const OBJECT_CRC_OFFSET = LAB_OBJECT_BYTES - 4;
-const OBJECT_MESSAGE = new TextEncoder().encode("MICROTECH-DYNAMIC-QR-OK");
+const OBJECT_MESSAGE = new TextEncoder().encode("JOINT-MAX-DYNAMIC-QR-OK");
 const GLOBAL_PILOT_REPEATS = 4;
+const QR_MATRIX_CACHE = new Map<string, IntegratedQrMatrix>();
 
 export type Point = Readonly<{ x: number; y: number }>;
 export type Rgb = Readonly<[number, number, number]>;
@@ -122,14 +138,13 @@ export type PreparedDynamicFrame = Readonly<{
 
 export type FrameGridDecode = Readonly<{
   frame: DynamicLabFrame;
-  repairMode: "direct-copy" | "dual-copy-consensus";
-  validCopies: number;
+  repairMode: "cauchy-mds-erasure";
+  correctedByteErasures: number;
+  inferredMaskId: number;
 }>;
 
 export type BootstrapControl = Readonly<{
-  sessionHex: string;
-  sequence: number;
-  maskId: number;
+  profile: typeof LAB_PROFILE_NAME;
 }>;
 
 export type DecoderProgress = Readonly<{
@@ -146,7 +161,7 @@ export function buildLabObject(sessionNonce: Uint8Array): DynamicLabObject {
   bytes.set(OBJECT_MAGIC, 0);
   bytes[4] = 0;
   bytes[5] = FRAME_VERSION;
-  bytes[6] = C8_MICROTECH_PROFILE_CODE;
+  bytes[6] = C8_JOINT_MAX_PROFILE_CODE;
   bytes[7] = OUTER_XOR_CODE;
   bytes.set(sessionNonce, 8);
   bytes[16] = OBJECT_MESSAGE.length;
@@ -168,7 +183,7 @@ export function parseLabObject(input: Uint8Array): DynamicLabObject {
   if (
     bytes[4] !== 0
     || bytes[5] !== FRAME_VERSION
-    || bytes[6] !== C8_MICROTECH_PROFILE_CODE
+    || bytes[6] !== C8_JOINT_MAX_PROFILE_CODE
     || bytes[7] !== OUTER_XOR_CODE
   ) throw new Error("lab object profile is not supported");
   const expectedCrc = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength).getUint32(OBJECT_CRC_OFFSET, false);
@@ -187,10 +202,10 @@ export function prepareDynamicFrame(
   previousPaletteStates: readonly number[] | null = null,
 ): PreparedDynamicFrame {
   let selected: PreparedDynamicFrame | null = null;
+  const bootstrap = buildBootstrapUrl(origin);
+  const matrix = createIntegratedQrMatrix(bootstrap);
   for (let maskId = 0; maskId < 16; maskId += 1) {
     const frame = buildDynamicFrame(sessionNonce, object, sequence, maskId);
-    const bootstrap = buildBootstrapUrl(origin, frame);
-    const matrix = createIntegratedQrMatrix(bootstrap);
     const unmaskedSymbols = buildUnmaskedPayloadSymbols(frame, matrix.payloadCells.length);
     const maskedSymbols = applyChromaMask(unmaskedSymbols, maskId, matrix.payloadCells);
     const paletteStates = composeIntegratedPalette(matrix, maskedSymbols);
@@ -224,7 +239,7 @@ export function buildDynamicFrame(
   bytes[4] = 0;
   bytes[5] = FRAME_VERSION;
   bytes[6] = frameKind === "systematic" ? 0 : 1;
-  bytes[7] = C8_MICROTECH_PROFILE_CODE;
+  bytes[7] = C8_JOINT_MAX_PROFILE_CODE;
   bytes.set(sessionNonce, 8);
   new DataView(bytes.buffer).setUint16(16, sequence, false);
   bytes[18] = maskId;
@@ -247,7 +262,7 @@ export function parseDynamicFrame(input: Uint8Array): DynamicLabFrame {
   if (
     bytes[4] !== 0
     || bytes[5] !== FRAME_VERSION
-    || bytes[7] !== C8_MICROTECH_PROFILE_CODE
+    || bytes[7] !== C8_JOINT_MAX_PROFILE_CODE
     || bytes[23] !== OUTER_XOR_CODE
   ) throw new Error("dynamic frame profile is not supported");
   if (bytes[6] !== 0 && bytes[6] !== 1) throw new Error("dynamic frame kind is invalid");
@@ -278,6 +293,8 @@ export function parseDynamicFrame(input: Uint8Array): DynamicLabFrame {
 }
 
 export function createIntegratedQrMatrix(bootstrap: string): IntegratedQrMatrix {
+  const cached = QR_MATRIX_CACHE.get(bootstrap);
+  if (cached) return cached;
   const qr = QRCode.create(bootstrap, {
     version: LAB_QR_VERSION,
     errorCorrectionLevel: LAB_QR_ERROR_CORRECTION,
@@ -295,10 +312,10 @@ export function createIntegratedQrMatrix(bootstrap: string): IntegratedQrMatrix 
     }
   }
   payloadCells.sort((left, right) => cellInterleaveKey(left) - cellInterleaveKey(right) || left.index - right.index);
-  if (payloadCells.length < LAB_SYMBOLS_PER_PACKET * LAB_PACKET_COPIES) {
+  if (payloadCells.length < LAB_SYMBOLS_PER_CODEWORD) {
     throw new Error("integrated QR does not have enough chroma payload modules");
   }
-  return {
+  const matrix = {
     size: qr.modules.size,
     bits,
     reserved,
@@ -306,6 +323,9 @@ export function createIntegratedQrMatrix(bootstrap: string): IntegratedQrMatrix 
     pilots,
     payloadCells,
   };
+  if (QR_MATRIX_CACHE.size >= 8) QR_MATRIX_CACHE.clear();
+  QR_MATRIX_CACHE.set(bootstrap, matrix);
+  return matrix;
 }
 
 export function encodeBytesToQuaternary(bytes: Uint8Array): number[] {
@@ -315,16 +335,25 @@ export function encodeBytesToQuaternary(bytes: Uint8Array): number[] {
 }
 
 export function decodeQuaternaryToBytes(symbols: readonly (number | null)[]): Uint8Array {
+  const optional = decodeQuaternaryToOptionalBytes(symbols);
+  if (optional.some((byte) => byte === null)) throw new Error("quaternary block contains an erasure");
+  return Uint8Array.from(optional as number[]);
+}
+
+export function decodeQuaternaryToOptionalBytes(symbols: readonly (number | null)[]): Array<number | null> {
   if (symbols.length % 4 !== 0) throw new Error("quaternary symbol count must be divisible by four");
-  const bytes = new Uint8Array(symbols.length / 4);
+  const bytes: Array<number | null> = [];
   for (let offset = 0; offset < symbols.length; offset += 4) {
     const group = symbols.slice(offset, offset + 4);
-    if (group.some((symbol) => symbol === null)) throw new Error("quaternary block contains an erasure");
+    if (group.some((symbol) => symbol === null)) {
+      bytes.push(null);
+      continue;
+    }
     if (group.some((symbol) => !Number.isInteger(symbol) || (symbol ?? -1) < 0 || (symbol ?? 4) >= LAB_CHROMA_RADIX)) {
       throw new Error("symbol is outside the active luminance quartet");
     }
     const values = group as number[];
-    bytes[offset / 4] = (values[0] << 6) | (values[1] << 4) | (values[2] << 2) | values[3];
+    bytes.push((values[0] << 6) | (values[1] << 4) | (values[2] << 2) | values[3]);
   }
   return bytes;
 }
@@ -358,10 +387,10 @@ export function removeChromaMask(
 export function decodeIntegratedPaletteSymbols(
   observedPaletteStates: readonly (number | null)[],
   matrix: IntegratedQrMatrix,
-  maskId: number,
+  knownMaskId?: number,
 ): FrameGridDecode {
-  if (observedPaletteStates.length < LAB_SYMBOLS_PER_PACKET * LAB_PACKET_COPIES) {
-    throw new Error("not enough integrated chroma symbols for frame copies");
+  if (observedPaletteStates.length < LAB_SYMBOLS_PER_CODEWORD) {
+    throw new Error("not enough integrated chroma symbols for the inner codeword");
   }
   const constrainedSymbols = observedPaletteStates.map((state, index) => {
     if (state === null) return null;
@@ -370,35 +399,37 @@ export function decodeIntegratedPaletteSymbols(
     if (expectedDark !== isDarkPaletteState(state)) return null;
     return state % LAB_CHROMA_RADIX;
   });
-  const symbols = removeChromaMask(constrainedSymbols, maskId, matrix.payloadCells);
-  const validFrames: DynamicLabFrame[] = [];
-  for (let copy = 0; copy < LAB_PACKET_COPIES; copy += 1) {
-    const start = copy * LAB_SYMBOLS_PER_PACKET;
+  const candidates = knownMaskId === undefined
+    ? Array.from({ length: 16 }, (_, maskId) => maskId)
+    : [knownMaskId];
+  const valid: FrameGridDecode[] = [];
+  for (const maskId of candidates) {
     try {
-      validFrames.push(parseDynamicFrame(decodeQuaternaryToBytes(symbols.slice(start, start + LAB_SYMBOLS_PER_PACKET))));
+      const symbols = removeChromaMask(constrainedSymbols, maskId, matrix.payloadCells)
+        .slice(0, LAB_SYMBOLS_PER_CODEWORD);
+      const codeword = decodeQuaternaryToOptionalBytes(symbols);
+      const decoded = decodeCauchyMds(codeword, LAB_PACKET_BYTES);
+      const frame = parseDynamicFrame(decoded.data);
+      if (frame.maskId !== maskId) continue;
+      valid.push({
+        frame,
+        repairMode: "cauchy-mds-erasure",
+        correctedByteErasures: decoded.recoveredDataErasures,
+        inferredMaskId: maskId,
+      });
     } catch {
-      // Erased, malformed, or CRC-invalid copies are rejected before outer decoding.
+      // Wrong masks and codewords outside the erasure budget are rejected.
     }
   }
-  if (validFrames.length > 0) {
-    const frame = validFrames[0];
-    if (validFrames.some((candidate) => candidate.sessionHex !== frame.sessionHex || candidate.sequence !== frame.sequence)) {
-      throw new Error("valid integrated frame copies disagree");
-    }
-    return { frame, repairMode: "direct-copy", validCopies: validFrames.length };
+  if (valid.length === 0) throw new Error("no chroma mask produced a valid MDS and CRC32 frame");
+  const decoded = valid[0];
+  if (valid.some((candidate) => (
+    candidate.frame.sessionHex !== decoded.frame.sessionHex
+    || candidate.frame.sequence !== decoded.frame.sequence
+  ))) {
+    throw new Error("multiple valid chroma masks disagree");
   }
-
-  const consensus: Array<number | null> = [];
-  for (let index = 0; index < LAB_SYMBOLS_PER_PACKET; index += 1) {
-    const first = symbols[index];
-    const second = symbols[index + LAB_SYMBOLS_PER_PACKET];
-    consensus.push(first === second ? first : first === null ? second : second === null ? first : null);
-  }
-  return {
-    frame: parseDynamicFrame(decodeQuaternaryToBytes(consensus)),
-    repairMode: "dual-copy-consensus",
-    validCopies: 0,
-  };
+  return decoded;
 }
 
 export function moduleCenter(cell: Pick<IntegratedCell, "row" | "column">): Point {
@@ -408,25 +439,24 @@ export function moduleCenter(cell: Pick<IntegratedCell, "row" | "column">): Poin
   };
 }
 
-export function buildBootstrapUrl(origin: string, frame: DynamicLabFrame): string {
-  const url = new URL("/optical-lab?role=reader", origin);
-  url.hash = `${LAB_BOOTSTRAP_PREFIX}.${frame.sessionHex}.${frame.sequence.toString(36)}.${frame.maskId.toString(16)}`;
-  return url.toString();
+export function buildBootstrapUrl(origin: string): string {
+  return new URL(LAB_BOOTSTRAP_PATH, origin).toString();
 }
 
 export function parseBootstrapUrl(value: string, expectedOrigin?: string): BootstrapControl {
   const url = new URL(value);
   const secureOrigin = url.protocol === "https:"
     || (url.protocol === "http:" && (url.hostname === "localhost" || url.hostname === "127.0.0.1"));
-  if (!secureOrigin || (expectedOrigin && url.origin !== expectedOrigin) || url.pathname !== "/optical-lab" || url.searchParams.get("role") !== "reader") {
+  if (
+    !secureOrigin
+    || (expectedOrigin && url.origin !== expectedOrigin)
+    || url.pathname !== LAB_BOOTSTRAP_PATH
+    || url.search !== ""
+    || url.hash !== ""
+  ) {
     throw new Error("bootstrap URL is not an accepted optical-lab origin");
   }
-  const match = url.hash.match(/^#PRISM-IQR2\.([0-9a-f]{16})\.([0-9a-z]+)\.([0-9a-f])$/);
-  if (!match) throw new Error("bootstrap control header is invalid");
-  const sequence = Number.parseInt(match[2], 36);
-  const maskId = Number.parseInt(match[3], 16);
-  if (!Number.isSafeInteger(sequence) || sequence < 0 || sequence > 0xffff) throw new Error("bootstrap sequence is invalid");
-  return { sessionHex: match[1], sequence, maskId };
+  return { profile: LAB_PROFILE_NAME };
 }
 
 export class DynamicLabDecoder {
@@ -560,7 +590,12 @@ export function localizePalette(globalModel: PaletteModel, pilots: readonly Rgb[
   return { means, inverseVariances };
 }
 
-export function classifyColor(observed: Rgb, model: PaletteModel): SoftClassification {
+export function classifyColor(
+  observed: Rgb,
+  model: PaletteModel,
+  erasureThreshold = LAB_ERASURE_THRESHOLD,
+): SoftClassification {
+  if (!Number.isFinite(erasureThreshold) || erasureThreshold < 0) throw new Error("erasure threshold must be non-negative");
   const ranked = model.means.map((mean, symbol) => {
     let distance = 0;
     for (let channel = 0; channel < 3; channel += 1) {
@@ -573,7 +608,7 @@ export function classifyColor(observed: Rgb, model: PaletteModel): SoftClassific
     symbol: ranked[0].symbol,
     secondSymbol: ranked[1].symbol,
     confidence,
-    erasure: confidence < LAB_ERASURE_THRESHOLD,
+    erasure: confidence < erasureThreshold,
   };
 }
 
@@ -698,8 +733,8 @@ function composeIntegratedPalette(matrix: IntegratedQrMatrix, maskedSymbols: rea
 }
 
 function buildUnmaskedPayloadSymbols(frame: DynamicLabFrame, capacity: number): number[] {
-  const packetSymbols = encodeBytesToQuaternary(frame.bytes);
-  const symbols = [...packetSymbols, ...packetSymbols];
+  const codeword = encodeCauchyMds(frame.bytes, LAB_INNER_PARITY_BYTES);
+  const symbols = encodeBytesToQuaternary(codeword);
   let state = (seedFromBytes(frame.bytes.subarray(8, 16)) ^ frame.sequence ^ 0x639ac3d1) >>> 0;
   while (symbols.length < capacity) {
     state = xorshift32(state);

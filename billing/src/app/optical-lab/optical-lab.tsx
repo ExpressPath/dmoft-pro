@@ -7,14 +7,20 @@ import {
   C8_QR_PALETTE,
   DynamicLabDecoder,
   LAB_FRAME,
+  LAB_GEOMETRY_RELOCK_INTERVAL,
+  LAB_INNER_CODE_RATE,
+  LAB_INNER_PARITY_BYTES,
   LAB_OBJECT_BYTES,
   LAB_PALETTE_SIZE,
+  LAB_PROFILE_AREA_GAIN,
   LAB_PROFILE_NAME,
   LAB_QUIET_ZONE_AREA_GAIN,
   LAB_QR_ERROR_CORRECTION,
   LAB_QR_VERSION,
   LAB_SOURCE_CHUNK_COUNT,
+  LAB_SOURCE_CHUNK_BYTES,
   LAB_TARGET_FPS,
+  LAB_VERIFIED_PAYLOAD_DENSITY_GAIN,
   buildLabObject,
   classifyColor,
   createIntegratedQrMatrix,
@@ -27,7 +33,6 @@ import {
   prepareDynamicFrame,
   projectPoint,
   solveHomography,
-  type BootstrapControl,
   type DecoderProgress,
   type DynamicLabFrame,
   type DynamicLabObject,
@@ -36,6 +41,7 @@ import {
   type PreparedDynamicFrame,
   type Rgb,
 } from "@/lib/optical-lab";
+import { optimizeCapturePolicy, type CapturePolicy } from "@/lib/optical-optimizer";
 
 import styles from "./optical-lab.module.css";
 
@@ -72,7 +78,12 @@ type ReaderMetrics = Readonly<DecoderProgress & {
   lastFrameKind: DynamicLabFrame["frameKind"] | null;
   confidence: number;
   erasures: number;
-  recommendation: "C8" | "C4" | "BW";
+  correctedByteErasures: number;
+  geometryMode: "detected" | "tracked" | null;
+  targetFps: number;
+  geometryRelockInterval: number;
+  estimatedFrameAcceptance: number;
+  verifiedBytesPerSecond: number;
 }>;
 
 type ReaderSuccess = Readonly<{
@@ -86,6 +97,14 @@ const QR_SOURCE_CORNERS: readonly Point[] = [
   { x: LAB_FRAME.qrX + LAB_FRAME.qrSize, y: LAB_FRAME.qrY + LAB_FRAME.qrSize },
   { x: LAB_FRAME.qrX, y: LAB_FRAME.qrY + LAB_FRAME.qrSize },
 ];
+const DEFAULT_CAPTURE_POLICY: CapturePolicy = optimizeCapturePolicy({
+  cellErasureRate: 0.01,
+  frameDetectionRate: 0.95,
+  meanConfidence: 8,
+  qrDetectionMs: 40,
+  chromaDecodeMs: 24,
+  motionRisk: 0.02,
+});
 const EMPTY_PROGRESS: ReaderMetrics = {
   rank: 0,
   required: LAB_SOURCE_CHUNK_COUNT,
@@ -97,7 +116,12 @@ const EMPTY_PROGRESS: ReaderMetrics = {
   lastFrameKind: null,
   confidence: 0,
   erasures: 0,
-  recommendation: "C8",
+  correctedByteErasures: 0,
+  geometryMode: null,
+  targetFps: DEFAULT_CAPTURE_POLICY.targetFps,
+  geometryRelockInterval: DEFAULT_CAPTURE_POLICY.geometryRelockInterval,
+  estimatedFrameAcceptance: 0,
+  verifiedBytesPerSecond: 0,
 };
 
 export function OpticalLab({ initialRole }: { initialRole: Role }) {
@@ -116,8 +140,20 @@ export function OpticalLab({ initialRole }: { initialRole: Role }) {
   const animationFrameRef = useRef<number | null>(null);
   const scanningRef = useRef(false);
   const lastScanTimeRef = useRef(0);
+  const scanIntervalRef = useRef(1000 / DEFAULT_CAPTURE_POLICY.targetFps);
   const diagnosticFrameRef = useRef(0);
   const rejectedFramesRef = useRef(0);
+  const qrAttemptsRef = useRef(0);
+  const qrDetectedRef = useRef(0);
+  const qrDetectionMsRef = useRef(40);
+  const chromaDecodeMsRef = useRef(24);
+  const motionRiskRef = useRef(0.02);
+  const capturePolicyRef = useRef<CapturePolicy>(DEFAULT_CAPTURE_POLICY);
+  const geometryTrackRef = useRef<{
+    bootstrap: string;
+    location: QrLocation;
+    framesSinceLock: number;
+  } | null>(null);
   const decoderRef = useRef<DynamicLabDecoder | null>(null);
 
   useEffect(() => {
@@ -152,7 +188,7 @@ export function OpticalLab({ initialRole }: { initialRole: Role }) {
             setSenderSelfTest(
               verified.decoded.frame.sessionHex === prepared.frame.sessionHex
                 && verified.decoded.frame.sequence === prepared.frame.sequence
-                ? "QR luminance + C8 chroma + CRC32 OK"
+                ? "QR + Cauchy-MDS40 + C8 chroma + CRC32 OK"
                 : "FAILED",
             );
           } catch {
@@ -213,6 +249,14 @@ export function OpticalLab({ initialRole }: { initialRole: Role }) {
   function resetReader() {
     decoderRef.current = null;
     rejectedFramesRef.current = 0;
+    qrAttemptsRef.current = 0;
+    qrDetectedRef.current = 0;
+    qrDetectionMsRef.current = 40;
+    chromaDecodeMsRef.current = 24;
+    motionRiskRef.current = 0.02;
+    capturePolicyRef.current = DEFAULT_CAPTURE_POLICY;
+    scanIntervalRef.current = 1000 / DEFAULT_CAPTURE_POLICY.targetFps;
+    geometryTrackRef.current = null;
     setReaderMetrics(EMPTY_PROGRESS);
     setReaderSuccess(null);
   }
@@ -262,7 +306,7 @@ export function OpticalLab({ initialRole }: { initialRole: Role }) {
   function scanCamera(timestamp: number) {
     if (!scanningRef.current) return;
     animationFrameRef.current = requestAnimationFrame(scanCamera);
-    if (timestamp - lastScanTimeRef.current < 90) return;
+    if (timestamp - lastScanTimeRef.current < scanIntervalRef.current) return;
     lastScanTimeRef.current = timestamp;
 
     const video = videoRef.current;
@@ -278,18 +322,58 @@ export function OpticalLab({ initialRole }: { initialRole: Role }) {
     if (!context) return;
     context.drawImage(video, 0, 0, canvas.width, canvas.height);
     const imageData = context.getImageData(0, 0, canvas.width, canvas.height);
-    const qr = jsQR(imageData.data, imageData.width, imageData.height, { inversionAttempts: "dontInvert" });
     diagnosticFrameRef.current += 1;
 
-    if (!qr) {
-      if (diagnosticFrameRef.current % 12 === 0) setReaderStatus("QR finder/timing/alignmentを探索中です。距離と反射を調整してください。");
-      return;
-    }
-
     try {
-      const control = parseBootstrapUrl(qr.data, window.location.origin);
-      const cameraFrame = decodeCameraImage(imageData, qr.location as QrLocation, qr.data);
-      assertControlMatchesFrame(control, cameraFrame.decoded.frame);
+      const previousTrack = geometryTrackRef.current;
+      const policy = capturePolicyRef.current;
+      const needsRelock = !previousTrack || previousTrack.framesSinceLock >= policy.geometryRelockInterval;
+      let bootstrap: string;
+      let location: QrLocation;
+      let geometryMode: ReaderMetrics["geometryMode"];
+      if (needsRelock) {
+        qrAttemptsRef.current += 1;
+        const detectionStarted = monotonicNow();
+        const qr = jsQR(imageData.data, imageData.width, imageData.height, { inversionAttempts: "dontInvert" });
+        qrDetectionMsRef.current = updateEwma(qrDetectionMsRef.current, monotonicNow() - detectionStarted, 0.2);
+        if (!qr) {
+          geometryTrackRef.current = null;
+          if (diagnosticFrameRef.current % 12 === 0) {
+            setReaderStatus("QR finder/timing/alignmentを探索中です。距離と反射を調整してください。");
+          }
+          return;
+        }
+        parseBootstrapUrl(qr.data, window.location.origin);
+        qrDetectedRef.current += 1;
+        bootstrap = qr.data;
+        location = qr.location as QrLocation;
+        if (previousTrack) {
+          motionRiskRef.current = updateEwma(
+            motionRiskRef.current,
+            cornerMotionRisk(previousTrack.location, location, imageData.width, imageData.height),
+            0.25,
+          );
+        }
+        geometryTrackRef.current = { bootstrap, location, framesSinceLock: 0 };
+        geometryMode = "detected";
+      } else {
+        bootstrap = previousTrack.bootstrap;
+        location = previousTrack.location;
+        geometryTrackRef.current = {
+          ...previousTrack,
+          framesSinceLock: previousTrack.framesSinceLock + 1,
+        };
+        geometryMode = "tracked";
+      }
+
+      const decodeStarted = monotonicNow();
+      const cameraFrame = decodeCameraImage(
+        imageData,
+        location,
+        bootstrap,
+        policy.erasureThreshold,
+      );
+      chromaDecodeMsRef.current = updateEwma(chromaDecodeMsRef.current, monotonicNow() - decodeStarted, 0.2);
 
       let decoder = decoderRef.current;
       if (!decoder || (decoder.progress().sessionHex && decoder.progress().sessionHex !== cameraFrame.decoded.frame.sessionHex)) {
@@ -299,6 +383,16 @@ export function OpticalLab({ initialRole }: { initialRole: Role }) {
       }
       decoder.addFrame(cameraFrame.decoded.frame);
       const progress = decoder.progress();
+      const optimizedPolicy = optimizeCapturePolicy({
+        cellErasureRate: cameraFrame.erasures / Math.max(1, cameraFrame.payloadCellCount),
+        frameDetectionRate: (qrDetectedRef.current + 1) / (qrAttemptsRef.current + 1),
+        meanConfidence: cameraFrame.confidence,
+        qrDetectionMs: qrDetectionMsRef.current,
+        chromaDecodeMs: chromaDecodeMsRef.current,
+        motionRisk: motionRiskRef.current,
+      });
+      capturePolicyRef.current = optimizedPolicy;
+      scanIntervalRef.current = 1000 / optimizedPolicy.targetFps;
       const metrics: ReaderMetrics = {
         ...progress,
         rejectedFrames: rejectedFramesRef.current,
@@ -306,7 +400,12 @@ export function OpticalLab({ initialRole }: { initialRole: Role }) {
         lastFrameKind: cameraFrame.decoded.frame.frameKind,
         confidence: cameraFrame.confidence,
         erasures: cameraFrame.erasures,
-        recommendation: recommendProfile(cameraFrame.confidence, cameraFrame.erasures, cameraFrame.payloadCellCount),
+        correctedByteErasures: cameraFrame.decoded.correctedByteErasures,
+        geometryMode,
+        targetFps: optimizedPolicy.targetFps,
+        geometryRelockInterval: optimizedPolicy.geometryRelockInterval,
+        estimatedFrameAcceptance: optimizedPolicy.estimatedFrameAcceptance,
+        verifiedBytesPerSecond: optimizedPolicy.verifiedBytesPerSecond,
       };
       setReaderMetrics(metrics);
       setReaderStatus(
@@ -320,6 +419,7 @@ export function OpticalLab({ initialRole }: { initialRole: Role }) {
       }
     } catch (error) {
       rejectedFramesRef.current += 1;
+      geometryTrackRef.current = null;
       if (diagnosticFrameRef.current % 5 === 0) {
         const detail = error instanceof Error ? error.message : "integrated color decode failed";
         setReaderStatus(`QR幾何を検出。低信頼chromaフレームを破棄して継続中: ${detail}`);
@@ -341,8 +441,8 @@ export function OpticalLab({ initialRole }: { initialRole: Role }) {
         <p className={styles.eyebrow}>One QR-family symbol · Dynamic multicolor</p>
         <h1 id="lab-title">Integrated Dynamic Color QR Lab</h1>
         <p>
-          QRと色パネルを並べる方式ではありません。1つの正方形QR格子のfinder・timing・alignment・quiet zoneを維持し、
-          同じdata moduleへ黒・白を含む8色の動的chroma情報を重ね、{LAB_OBJECT_BYTES.toLocaleString()}-byteを複数フレームで復元します。
+          固定V5/H bootstrapと黒・白を含む8色chromaを同じQR格子へ統合します。GF(256) Cauchy-MDS erasure code、
+          startless outer repair、geometry trackingを共同最適化し、{LAB_OBJECT_BYTES.toLocaleString()}-byte test objectを複数フレームで復元します。
         </p>
       </section>
 
@@ -377,7 +477,7 @@ export function OpticalLab({ initialRole }: { initialRole: Role }) {
           <ol className={styles.instructions}>
             <li>同じ正方形コードをスマホ標準カメラで読み、readerリンクを開きます。</li>
             <li>readerで「カメラを開始」を押し、Micro QR由来の2-module quiet zoneを含む正方形全体を映します。</li>
-            <li>黒白のQR輝度面が幾何とbootstrapを、同じmodule内の8色chroma面が動的データを運びます。</li>
+            <li>固定QR輝度面が短縮URLと幾何を、同じmodule内の8色chroma面だけが動的データを運びます。</li>
           </ol>
           <div className={styles.frameShell}>
             <canvas
@@ -399,6 +499,10 @@ export function OpticalLab({ initialRole }: { initialRole: Role }) {
             <span>Palette <strong>8 states · black/white included</strong></span>
             <span>Payload <strong>2 chroma bits / module</strong></span>
             <span>Quiet zone <strong>2 modules · +{((LAB_QUIET_ZONE_AREA_GAIN - 1) * 100).toFixed(1)}% area efficiency</strong></span>
+            <span>Footprint vs MICROTECH2 <strong>{LAB_PROFILE_AREA_GAIN.toFixed(2)}× area efficiency</strong></span>
+            <span>Useful density vs MICROTECH2 <strong>{LAB_VERIFIED_PAYLOAD_DENSITY_GAIN.toFixed(2)}×</strong></span>
+            <span>Inner FEC <strong>Cauchy-MDS [250,210] · R={LAB_INNER_CODE_RATE.toFixed(2)}</strong></span>
+            <span>Source/frame <strong>{LAB_SOURCE_CHUNK_BYTES} bytes</strong></span>
             <span>Usable modules <strong>{senderMetrics?.payloadCells ?? "…"}</strong></span>
             <span>Integrated pilots <strong>{senderMetrics?.pilotCells ?? "…"}</strong></span>
             <span>Self-test <strong>{senderSelfTest}</strong></span>
@@ -406,8 +510,8 @@ export function OpticalLab({ initialRole }: { initialRole: Role }) {
           </div>
           <p className={styles.algorithmNote}>
             Function moduleは純粋な黒白のまま保持します。Data moduleはQR bitがdarkなら黒・赤・濃緑・青、lightなら白・黄・cyan・magentaから選択し、
-            CIE Lab色差・同色隣接・時間遷移を評価して16個の可逆maskから最良を選びます。Micro QR由来の2-module marginと、
-            global 8-color pilots＋tileごとのblack/white anchorsで校正面積を圧縮します。独立した校正帯や別QRはありません。
+            CIE Lab色差・同色隣接・時間遷移を評価して16個の可逆maskから最良を選びます。固定短縮bootstrapによりQR生成を再利用し、
+            {LAB_INNER_PARITY_BYTES} parity bytesで既知byte erasureを回復します。最大{LAB_GEOMETRY_RELOCK_INTERVAL}フレームのgeometry trackingで再検出負荷を削減します。
           </p>
         </section>
       ) : (
@@ -451,8 +555,12 @@ export function OpticalLab({ initialRole }: { initialRole: Role }) {
               <span>Rejected <strong>{readerMetrics.rejectedFrames}</strong></span>
               <span>Last frame <strong>{readerMetrics.lastSequence ?? "—"} · {readerMetrics.lastFrameKind ?? "—"}</strong></span>
               <span>Confidence <strong>{readerMetrics.confidence.toFixed(2)}</strong></span>
-              <span>Erasures <strong>{readerMetrics.erasures}</strong></span>
-              <span>Channel recommendation <strong>{readerMetrics.recommendation}</strong></span>
+              <span>Cell erasures <strong>{readerMetrics.erasures}</strong></span>
+              <span>MDS recovered bytes <strong>{readerMetrics.correctedByteErasures}</strong></span>
+              <span>Geometry <strong>{readerMetrics.geometryMode ?? "—"} · relock/{readerMetrics.geometryRelockInterval}</strong></span>
+              <span>Adaptive rate <strong>{readerMetrics.targetFps} FPS</strong></span>
+              <span>Estimated acceptance <strong>{(readerMetrics.estimatedFrameAcceptance * 100).toFixed(1)}%</strong></span>
+              <span>Estimated verified rate <strong>{readerMetrics.verifiedBytesPerSecond.toFixed(0)} B/s</strong></span>
             </div>
           </div>
 
@@ -467,6 +575,7 @@ export function OpticalLab({ initialRole }: { initialRole: Role }) {
                 <div><dt>Last mode</dt><dd>{readerSuccess.metrics.lastFrameKind}</dd></div>
                 <div><dt>Mean confidence</dt><dd>{readerSuccess.metrics.confidence.toFixed(2)}</dd></div>
                 <div><dt>Erasures</dt><dd>{readerSuccess.metrics.erasures}</dd></div>
+                <div><dt>MDS recovered bytes</dt><dd>{readerSuccess.metrics.correctedByteErasures}</dd></div>
               </dl>
             </div>
           ) : null}
@@ -510,7 +619,12 @@ function renderSenderFrame(canvas: HTMLCanvasElement, prepared: PreparedDynamicF
   visibleContext.drawImage(renderCanvas, 0, 0);
 }
 
-function decodeCameraImage(image: ImageData, location: QrLocation, bootstrap: string): DecodedCameraFrame {
+function decodeCameraImage(
+  image: ImageData,
+  location: QrLocation,
+  bootstrap: string,
+  erasureThreshold = 2,
+): DecodedCameraFrame {
   const matrix = createIntegratedQrMatrix(bootstrap);
   const destination = [
     location.topLeftCorner,
@@ -555,6 +669,7 @@ function decodeCameraImage(image: ImageData, location: QrLocation, bootstrap: st
     const classified = classifyColor(
       sampleRgb(image, projectPoint(homography, moduleCenter(cell)), sampleRadius),
       model,
+      erasureThreshold,
     );
     const luminanceMismatch = isDarkPaletteState(classified.symbol) !== (matrix.bits[cell.index] === 1);
     const erasure = classified.erasure || luminanceMismatch;
@@ -563,8 +678,8 @@ function decodeCameraImage(image: ImageData, location: QrLocation, bootstrap: st
     observedStates.push(erasure ? null : classified.symbol);
   }
 
-  const control = parseBootstrapUrl(bootstrap, window.location.origin);
-  const decoded = decodeIntegratedPaletteSymbols(observedStates, matrix, control.maskId);
+  parseBootstrapUrl(bootstrap, window.location.origin);
+  const decoded = decodeIntegratedPaletteSymbols(observedStates, matrix);
   const confidence = confidences.length === 0
     ? 0
     : confidences.reduce((sum, value) => sum + value, 0) / confidences.length;
@@ -577,23 +692,26 @@ function verifyRenderedFrame(canvas: HTMLCanvasElement): DecodedCameraFrame {
   const image = context.getImageData(0, 0, canvas.width, canvas.height);
   const qr = jsQR(image.data, image.width, image.height, { inversionAttempts: "dontInvert" });
   if (!qr) throw new Error("integrated QR luminance plane did not self-decode");
-  const control = parseBootstrapUrl(qr.data, window.location.origin);
-  const decoded = decodeCameraImage(image, qr.location as QrLocation, qr.data);
-  assertControlMatchesFrame(control, decoded.decoded.frame);
-  return decoded;
+  parseBootstrapUrl(qr.data, window.location.origin);
+  return decodeCameraImage(image, qr.location as QrLocation, qr.data);
 }
 
-function assertControlMatchesFrame(control: BootstrapControl, frame: DynamicLabFrame) {
-  if (control.sessionHex !== frame.sessionHex || control.sequence !== frame.sequence || control.maskId !== frame.maskId) {
-    throw new Error("integrated QR control and chroma payload disagree");
-  }
+function cornerMotionRisk(previous: QrLocation, current: QrLocation, width: number, height: number): number {
+  const previousCorners = [previous.topLeftCorner, previous.topRightCorner, previous.bottomRightCorner, previous.bottomLeftCorner];
+  const currentCorners = [current.topLeftCorner, current.topRightCorner, current.bottomRightCorner, current.bottomLeftCorner];
+  const diagonal = Math.max(1, Math.hypot(width, height));
+  const normalizedMotion = previousCorners.reduce((sum, corner, index) => (
+    sum + distance(corner, currentCorners[index])
+  ), 0) / (previousCorners.length * diagonal);
+  return Math.max(0, Math.min(1, normalizedMotion * 12));
 }
 
-function recommendProfile(confidence: number, erasures: number, payloadCells: number): "C8" | "C4" | "BW" {
-  const erasureRate = erasures / Math.max(1, payloadCells);
-  if (erasureRate > 0.15 || confidence < 2.5) return "BW";
-  if (erasureRate > 0.08 || confidence < 5) return "C4";
-  return "C8";
+function updateEwma(previous: number, observed: number, alpha: number): number {
+  return (alpha * observed) + ((1 - alpha) * previous);
+}
+
+function monotonicNow(): number {
+  return performance.now();
 }
 
 function tileKey(tileRow: number, tileColumn: number): string {
