@@ -1,68 +1,77 @@
+import QRCode from "qrcode";
+
+export const LAB_QR_VERSION = 10;
+export const LAB_QR_MODULES = 17 + (4 * LAB_QR_VERSION);
+export const LAB_QR_ERROR_CORRECTION = "H" as const;
 export const LAB_FRAME = {
-  width: 768,
-  height: 496,
-  qrX: 32,
-  qrY: 32,
-  qrSize: 256,
-  dataX: 304,
-  dataY: 32,
-  dataColumns: 24,
-  dataRows: 24,
-  cellPitch: 18,
-  coloredCoreRatio: 0.75,
+  width: 780,
+  height: 780,
+  qrX: 48,
+  qrY: 48,
+  qrSize: 684,
+  modulePitch: 12,
+  moduleCount: LAB_QR_MODULES,
+  quietModules: 4,
   tileSize: 8,
-  calibrationX: 32,
-  calibrationY: 320,
-  calibrationColumns: 8,
-  calibrationRows: 4,
-  calibrationPitch: 24,
 } as const;
 
-export const LAB_PROFILE_NAME = "PRISM-C6-DYNAMIC-LAB2";
-export const LAB_BOOTSTRAP_PREFIX = "PRISM-DYN2";
+export const LAB_PROFILE_NAME = "PRISM-C8-QR-INTEGRATED1";
+export const LAB_BOOTSTRAP_PREFIX = "PRISM-IQR1";
 export const LAB_TARGET_FPS = 8;
-export const LAB_RADIX = 6;
-export const LAB_PACKET_BYTES = 64;
+export const LAB_PALETTE_SIZE = 8;
+export const LAB_CHROMA_RADIX = 4;
+export const LAB_PACKET_BYTES = 256;
 export const LAB_PACKET_COPIES = 2;
-export const LAB_SOURCE_CHUNK_BYTES = 24;
+export const LAB_SOURCE_CHUNK_BYTES = 192;
 export const LAB_SOURCE_CHUNK_COUNT = 8;
 export const LAB_OBJECT_BYTES = LAB_SOURCE_CHUNK_BYTES * LAB_SOURCE_CHUNK_COUNT;
+export const LAB_SYMBOLS_PER_PACKET = LAB_PACKET_BYTES * 4;
 export const LAB_ERASURE_THRESHOLD = 2;
 
-export const C6_PALETTE = [
-  [220, 35, 45],
-  [25, 165, 75],
-  [35, 85, 215],
-  [235, 195, 30],
-  [20, 178, 190],
-  [190, 55, 185],
+// States 0-3 must remain below the QR luminance threshold; states 4-7 must remain above it.
+export const C8_QR_PALETTE = [
+  [0, 0, 0],
+  [195, 20, 25],
+  [0, 115, 45],
+  [25, 55, 190],
+  [255, 255, 255],
+  [250, 225, 20],
+  [35, 215, 225],
+  [245, 135, 225],
 ] as const;
 
 const PACKET_MAGIC = new Uint8Array([0x44, 0x4d, 0x4f, 0x46]);
 const OBJECT_MAGIC = new Uint8Array([0x50, 0x47, 0x44, 0x4f]);
-const FRAME_VERSION = 2;
-const C6_PROFILE_CODE = 6;
+const FRAME_VERSION = 3;
+const C8_INTEGRATED_PROFILE_CODE = 8;
 const OUTER_XOR_CODE = 1;
-const RADIX_BLOCK_BYTES = 8;
-const RADIX_DIGITS_PER_BLOCK = 25;
-const FRAME_CRC_OFFSET = 60;
+const FRAME_PAYLOAD_OFFSET = 32;
+const FRAME_CRC_OFFSET = LAB_PACKET_BYTES - 4;
 const OBJECT_CRC_OFFSET = LAB_OBJECT_BYTES - 4;
-const OBJECT_MESSAGE = new TextEncoder().encode("STARTLESS-DYNAMIC-OK");
-const PILOTS = [
-  { x: 0, y: 0, symbol: 0 },
-  { x: 7, y: 0, symbol: 1 },
-  { x: 0, y: 7, symbol: 2 },
-  { x: 7, y: 7, symbol: 3 },
-  { x: 3, y: 0, symbol: 4 },
-  { x: 4, y: 7, symbol: 5 },
-] as const;
-const PILOT_KEYS = new Set(PILOTS.map(({ x, y }) => `${x}:${y}`));
-
-export const LAB_SYMBOLS_PER_PACKET = (LAB_PACKET_BYTES / RADIX_BLOCK_BYTES) * RADIX_DIGITS_PER_BLOCK;
+const OBJECT_MESSAGE = new TextEncoder().encode("INTEGRATED-DYNAMIC-QR-OK");
+const PILOTS_PER_LUMINANCE_CLASS = 4;
 
 export type Point = Readonly<{ x: number; y: number }>;
 export type Rgb = Readonly<[number, number, number]>;
-type CellSlot = Readonly<Point & { column: number; row: number }>;
+
+export type IntegratedCell = Readonly<{
+  index: number;
+  row: number;
+  column: number;
+  tileRow: number;
+  tileColumn: number;
+}>;
+
+export type IntegratedPilot = Readonly<IntegratedCell & { paletteState: number }>;
+
+export type IntegratedQrMatrix = Readonly<{
+  size: number;
+  bits: Uint8Array;
+  reserved: Uint8Array;
+  qrMaskPattern: number;
+  pilots: readonly IntegratedPilot[];
+  payloadCells: readonly IntegratedCell[];
+}>;
 
 export type PaletteModel = Readonly<{
   means: readonly Rgb[];
@@ -96,7 +105,9 @@ export type DynamicLabFrame = Readonly<{
 
 export type PreparedDynamicFrame = Readonly<{
   frame: DynamicLabFrame;
-  displayedSymbols: number[];
+  bootstrap: string;
+  matrix: IntegratedQrMatrix;
+  paletteStates: Uint8Array;
   maskScore: number;
 }>;
 
@@ -126,7 +137,7 @@ export function buildLabObject(sessionNonce: Uint8Array): DynamicLabObject {
   bytes.set(OBJECT_MAGIC, 0);
   bytes[4] = 0;
   bytes[5] = FRAME_VERSION;
-  bytes[6] = C6_PROFILE_CODE;
+  bytes[6] = C8_INTEGRATED_PROFILE_CODE;
   bytes[7] = OUTER_XOR_CODE;
   bytes.set(sessionNonce, 8);
   bytes[16] = OBJECT_MESSAGE.length;
@@ -145,9 +156,12 @@ export function parseLabObject(input: Uint8Array): DynamicLabObject {
   const bytes = Uint8Array.from(input);
   if (bytes.length !== LAB_OBJECT_BYTES) throw new Error(`lab object must be ${LAB_OBJECT_BYTES} bytes`);
   assertMagic(bytes, OBJECT_MAGIC, "lab object");
-  if (bytes[4] !== 0 || bytes[5] !== FRAME_VERSION || bytes[6] !== C6_PROFILE_CODE || bytes[7] !== OUTER_XOR_CODE) {
-    throw new Error("lab object profile is not supported");
-  }
+  if (
+    bytes[4] !== 0
+    || bytes[5] !== FRAME_VERSION
+    || bytes[6] !== C8_INTEGRATED_PROFILE_CODE
+    || bytes[7] !== OUTER_XOR_CODE
+  ) throw new Error("lab object profile is not supported");
   const expectedCrc = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength).getUint32(OBJECT_CRC_OFFSET, false);
   if (crc32(bytes.subarray(0, OBJECT_CRC_OFFSET)) !== expectedCrc) throw new Error("lab object CRC32 does not match");
   const messageLength = bytes[16];
@@ -160,14 +174,24 @@ export function prepareDynamicFrame(
   sessionNonce: Uint8Array,
   object: Uint8Array,
   sequence: number,
-  previousDisplayedSymbols: readonly number[] | null = null,
+  origin: string,
+  previousPaletteStates: readonly number[] | null = null,
 ): PreparedDynamicFrame {
-  const placeholder = buildDynamicFrame(sessionNonce, object, sequence, 0);
-  const placeholderSymbols = buildUnmaskedGridSymbols(placeholder);
-  const selected = selectVisualMask(placeholderSymbols, previousDisplayedSymbols);
-  const frame = buildDynamicFrame(sessionNonce, object, sequence, selected.maskId);
-  const displayedSymbols = applySymbolMask(buildUnmaskedGridSymbols(frame), selected.maskId);
-  return { frame, displayedSymbols, maskScore: scoreDisplayedSymbols(displayedSymbols, previousDisplayedSymbols) };
+  let selected: PreparedDynamicFrame | null = null;
+  for (let maskId = 0; maskId < 16; maskId += 1) {
+    const frame = buildDynamicFrame(sessionNonce, object, sequence, maskId);
+    const bootstrap = buildBootstrapUrl(origin, frame);
+    const matrix = createIntegratedQrMatrix(bootstrap);
+    const unmaskedSymbols = buildUnmaskedPayloadSymbols(frame, matrix.payloadCells.length);
+    const maskedSymbols = applyChromaMask(unmaskedSymbols, maskId, matrix.payloadCells);
+    const paletteStates = composeIntegratedPalette(matrix, maskedSymbols);
+    const maskScore = scorePaletteStates(matrix, paletteStates, previousPaletteStates);
+    if (!selected || maskScore > selected.maskScore) {
+      selected = { frame, bootstrap, matrix, paletteStates, maskScore };
+    }
+  }
+  if (!selected) throw new Error("no integrated chroma mask could be selected");
+  return selected;
 }
 
 export function buildDynamicFrame(
@@ -179,32 +203,31 @@ export function buildDynamicFrame(
   assertSessionNonce(sessionNonce);
   if (objectInput.length !== LAB_OBJECT_BYTES) throw new Error(`dynamic lab object must be ${LAB_OBJECT_BYTES} bytes`);
   if (!Number.isSafeInteger(sequence) || sequence < 0 || sequence > 0xffff) throw new Error("frame sequence must fit uint16");
-  if (!Number.isInteger(maskId) || maskId < 0 || maskId > 15) throw new Error("mask id must be between 0 and 15");
+  validateMaskId(maskId);
   const object = parseLabObject(objectInput);
   if (object.sessionHex !== toHex(sessionNonce)) throw new Error("object and frame sessions do not match");
 
   const frameKind = sequence < LAB_SOURCE_CHUNK_COUNT ? "systematic" : "repair";
-  const equationMask = frameKind === "systematic"
-    ? 1 << sequence
-    : repairEquationMask(sessionNonce, sequence);
+  const equationMask = frameKind === "systematic" ? 1 << sequence : repairEquationMask(sessionNonce, sequence);
   const payload = xorObjectChunks(object.bytes, equationMask);
   const bytes = new Uint8Array(LAB_PACKET_BYTES);
   bytes.set(PACKET_MAGIC, 0);
   bytes[4] = 0;
   bytes[5] = FRAME_VERSION;
   bytes[6] = frameKind === "systematic" ? 0 : 1;
-  bytes[7] = C6_PROFILE_CODE;
+  bytes[7] = C8_INTEGRATED_PROFILE_CODE;
   bytes.set(sessionNonce, 8);
   new DataView(bytes.buffer).setUint16(16, sequence, false);
   bytes[18] = maskId;
   bytes[19] = LAB_SOURCE_CHUNK_COUNT;
   bytes[20] = LAB_SOURCE_CHUNK_BYTES;
-  bytes[21] = LAB_SOURCE_CHUNK_BYTES;
+  bytes[21] = LAB_PACKET_COPIES;
   bytes[22] = equationMask;
   bytes[23] = OUTER_XOR_CODE;
   new DataView(bytes.buffer).setUint16(24, object.bytes.length, false);
   new DataView(bytes.buffer).setUint32(26, crc32(object.bytes), false);
-  bytes.set(payload, 30);
+  new DataView(bytes.buffer).setUint16(30, payload.length, false);
+  bytes.set(payload, FRAME_PAYLOAD_OFFSET);
   new DataView(bytes.buffer).setUint32(FRAME_CRC_OFFSET, crc32(bytes.subarray(0, FRAME_CRC_OFFSET)), false);
   return parseDynamicFrame(bytes);
 }
@@ -213,13 +236,19 @@ export function parseDynamicFrame(input: Uint8Array): DynamicLabFrame {
   const bytes = Uint8Array.from(input);
   if (bytes.length !== LAB_PACKET_BYTES) throw new Error(`dynamic frame must be ${LAB_PACKET_BYTES} bytes`);
   assertMagic(bytes, PACKET_MAGIC, "dynamic frame");
-  if (bytes[4] !== 0 || bytes[5] !== FRAME_VERSION || bytes[7] !== C6_PROFILE_CODE || bytes[23] !== OUTER_XOR_CODE) {
-    throw new Error("dynamic frame profile is not supported");
-  }
+  if (
+    bytes[4] !== 0
+    || bytes[5] !== FRAME_VERSION
+    || bytes[7] !== C8_INTEGRATED_PROFILE_CODE
+    || bytes[23] !== OUTER_XOR_CODE
+  ) throw new Error("dynamic frame profile is not supported");
   if (bytes[6] !== 0 && bytes[6] !== 1) throw new Error("dynamic frame kind is invalid");
-  if (bytes[19] !== LAB_SOURCE_CHUNK_COUNT || bytes[20] !== LAB_SOURCE_CHUNK_BYTES || bytes[21] !== LAB_SOURCE_CHUNK_BYTES) {
-    throw new Error("dynamic frame source geometry is invalid");
-  }
+  if (
+    bytes[19] !== LAB_SOURCE_CHUNK_COUNT
+    || bytes[20] !== LAB_SOURCE_CHUNK_BYTES
+    || bytes[21] !== LAB_PACKET_COPIES
+    || new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength).getUint16(30, false) !== LAB_SOURCE_CHUNK_BYTES
+  ) throw new Error("dynamic frame source geometry is invalid");
   if (bytes[18] > 15 || bytes[22] === 0) throw new Error("dynamic frame mask metadata is invalid");
   const expectedCrc = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength).getUint32(FRAME_CRC_OFFSET, false);
   if (crc32(bytes.subarray(0, FRAME_CRC_OFFSET)) !== expectedCrc) throw new Error("dynamic frame CRC32 does not match");
@@ -236,68 +265,118 @@ export function parseDynamicFrame(input: Uint8Array): DynamicLabFrame {
     equationMask: bytes[22],
     objectLength: new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength).getUint16(24, false),
     objectCrc: new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength).getUint32(26, false),
-    payload: bytes.slice(30, 30 + LAB_SOURCE_CHUNK_BYTES),
+    payload: bytes.slice(FRAME_PAYLOAD_OFFSET, FRAME_PAYLOAD_OFFSET + LAB_SOURCE_CHUNK_BYTES),
     bytes,
   };
 }
 
-export function encodeBytesToRadix6(bytes: Uint8Array): number[] {
-  if (bytes.length % RADIX_BLOCK_BYTES !== 0) throw new Error("radix-6 input must contain complete 8-byte blocks");
-  const digits: number[] = [];
-  for (let offset = 0; offset < bytes.length; offset += RADIX_BLOCK_BYTES) {
-    let value = 0n;
-    for (let index = 0; index < RADIX_BLOCK_BYTES; index += 1) value = (value << 8n) | BigInt(bytes[offset + index]);
-    const block = new Array<number>(RADIX_DIGITS_PER_BLOCK).fill(0);
-    for (let index = RADIX_DIGITS_PER_BLOCK - 1; index >= 0; index -= 1) {
-      block[index] = Number(value % 6n);
-      value /= 6n;
+export function createIntegratedQrMatrix(bootstrap: string): IntegratedQrMatrix {
+  const qr = QRCode.create(bootstrap, {
+    version: LAB_QR_VERSION,
+    errorCorrectionLevel: LAB_QR_ERROR_CORRECTION,
+  });
+  if (qr.modules.size !== LAB_QR_MODULES) throw new Error("integrated QR module count is not stable");
+  const bits = Uint8Array.from(qr.modules.data, (value) => value ? 1 : 0);
+  const reserved = Uint8Array.from(qr.modules.reservedBit, (value) => value ? 1 : 0);
+  const pilots = selectIntegratedPilots(bits, reserved, qr.modules.size);
+  const pilotIndexes = new Set(pilots.map((pilot) => pilot.index));
+  const payloadCells: IntegratedCell[] = [];
+  for (let row = 0; row < qr.modules.size; row += 1) {
+    for (let column = 0; column < qr.modules.size; column += 1) {
+      const index = row * qr.modules.size + column;
+      if (!reserved[index] && !pilotIndexes.has(index)) payloadCells.push(createCell(row, column, qr.modules.size));
     }
-    digits.push(...block);
   }
-  return digits;
+  payloadCells.sort((left, right) => cellInterleaveKey(left) - cellInterleaveKey(right) || left.index - right.index);
+  if (payloadCells.length < LAB_SYMBOLS_PER_PACKET * LAB_PACKET_COPIES) {
+    throw new Error("integrated QR does not have enough chroma payload modules");
+  }
+  return {
+    size: qr.modules.size,
+    bits,
+    reserved,
+    qrMaskPattern: qr.maskPattern ?? 0,
+    pilots,
+    payloadCells,
+  };
 }
 
-export function decodeRadix6ToBytes(symbols: readonly (number | null)[]): Uint8Array {
-  if (symbols.length % RADIX_DIGITS_PER_BLOCK !== 0) throw new Error("radix-6 symbols must contain complete blocks");
-  const bytes = new Uint8Array((symbols.length / RADIX_DIGITS_PER_BLOCK) * RADIX_BLOCK_BYTES);
-  const limit = 1n << 64n;
-  for (let offset = 0; offset < symbols.length; offset += RADIX_DIGITS_PER_BLOCK) {
-    let value = 0n;
-    for (let index = 0; index < RADIX_DIGITS_PER_BLOCK; index += 1) {
-      const symbol = symbols[offset + index];
-      if (symbol === null) throw new Error("radix-6 block contains an erasure");
-      if (!Number.isInteger(symbol) || symbol < 0 || symbol >= LAB_RADIX) throw new Error("symbol is outside the C6 palette");
-      value = (value * 6n) + BigInt(symbol);
+export function encodeBytesToQuaternary(bytes: Uint8Array): number[] {
+  const symbols: number[] = [];
+  for (const byte of bytes) symbols.push((byte >>> 6) & 3, (byte >>> 4) & 3, (byte >>> 2) & 3, byte & 3);
+  return symbols;
+}
+
+export function decodeQuaternaryToBytes(symbols: readonly (number | null)[]): Uint8Array {
+  if (symbols.length % 4 !== 0) throw new Error("quaternary symbol count must be divisible by four");
+  const bytes = new Uint8Array(symbols.length / 4);
+  for (let offset = 0; offset < symbols.length; offset += 4) {
+    const group = symbols.slice(offset, offset + 4);
+    if (group.some((symbol) => symbol === null)) throw new Error("quaternary block contains an erasure");
+    if (group.some((symbol) => !Number.isInteger(symbol) || (symbol ?? -1) < 0 || (symbol ?? 4) >= LAB_CHROMA_RADIX)) {
+      throw new Error("symbol is outside the active luminance quartet");
     }
-    if (value >= limit) throw new Error("radix-6 block is not canonical");
-    const byteOffset = (offset / RADIX_DIGITS_PER_BLOCK) * RADIX_BLOCK_BYTES;
-    for (let index = RADIX_BLOCK_BYTES - 1; index >= 0; index -= 1) {
-      bytes[byteOffset + index] = Number(value & 0xffn);
-      value >>= 8n;
-    }
+    const values = group as number[];
+    bytes[offset / 4] = (values[0] << 6) | (values[1] << 4) | (values[2] << 2) | values[3];
   }
   return bytes;
 }
 
-export function decodeDynamicGridSymbols(
-  displayedSymbols: readonly (number | null)[],
+export function applyChromaMask(
+  symbols: readonly number[],
+  maskId: number,
+  cells: readonly IntegratedCell[],
+): number[] {
+  validateMaskId(maskId);
+  if (symbols.length > cells.length) throw new Error("chroma symbols exceed integrated payload cells");
+  return symbols.map((symbol, index) => modulo(
+    symbol + chromaMaskDelta(maskId, cells[index].row, cells[index].column),
+    LAB_CHROMA_RADIX,
+  ));
+}
+
+export function removeChromaMask(
+  symbols: readonly (number | null)[],
+  maskId: number,
+  cells: readonly IntegratedCell[],
+): Array<number | null> {
+  validateMaskId(maskId);
+  if (symbols.length > cells.length) throw new Error("chroma symbols exceed integrated payload cells");
+  return symbols.map((symbol, index) => symbol === null ? null : modulo(
+    symbol - chromaMaskDelta(maskId, cells[index].row, cells[index].column),
+    LAB_CHROMA_RADIX,
+  ));
+}
+
+export function decodeIntegratedPaletteSymbols(
+  observedPaletteStates: readonly (number | null)[],
+  matrix: IntegratedQrMatrix,
   maskId: number,
 ): FrameGridDecode {
-  if (displayedSymbols.length < LAB_SYMBOLS_PER_PACKET * LAB_PACKET_COPIES) throw new Error("not enough C6 symbols for dynamic frame copies");
-  const symbols = removeSymbolMask(displayedSymbols, maskId);
+  if (observedPaletteStates.length < LAB_SYMBOLS_PER_PACKET * LAB_PACKET_COPIES) {
+    throw new Error("not enough integrated chroma symbols for frame copies");
+  }
+  const constrainedSymbols = observedPaletteStates.map((state, index) => {
+    if (state === null) return null;
+    if (!Number.isInteger(state) || state < 0 || state >= LAB_PALETTE_SIZE) return null;
+    const expectedDark = matrix.bits[matrix.payloadCells[index].index] === 1;
+    if (expectedDark !== isDarkPaletteState(state)) return null;
+    return state % LAB_CHROMA_RADIX;
+  });
+  const symbols = removeChromaMask(constrainedSymbols, maskId, matrix.payloadCells);
   const validFrames: DynamicLabFrame[] = [];
   for (let copy = 0; copy < LAB_PACKET_COPIES; copy += 1) {
     const start = copy * LAB_SYMBOLS_PER_PACKET;
     try {
-      validFrames.push(parseDynamicFrame(decodeRadix6ToBytes(symbols.slice(start, start + LAB_SYMBOLS_PER_PACKET))));
+      validFrames.push(parseDynamicFrame(decodeQuaternaryToBytes(symbols.slice(start, start + LAB_SYMBOLS_PER_PACKET))));
     } catch {
-      // A copy with an erasure, non-canonical digit block, or CRC failure is rejected.
+      // Erased, malformed, or CRC-invalid copies are rejected before outer decoding.
     }
   }
   if (validFrames.length > 0) {
     const frame = validFrames[0];
     if (validFrames.some((candidate) => candidate.sessionHex !== frame.sessionHex || candidate.sequence !== frame.sequence)) {
-      throw new Error("valid frame copies disagree");
+      throw new Error("valid integrated frame copies disagree");
     }
     return { frame, repairMode: "direct-copy", validCopies: validFrames.length };
   }
@@ -309,37 +388,17 @@ export function decodeDynamicGridSymbols(
     consensus.push(first === second ? first : first === null ? second : second === null ? first : null);
   }
   return {
-    frame: parseDynamicFrame(decodeRadix6ToBytes(consensus)),
+    frame: parseDynamicFrame(decodeQuaternaryToBytes(consensus)),
     repairMode: "dual-copy-consensus",
     validCopies: 0,
   };
 }
 
-export function applySymbolMask(symbols: readonly number[], maskId: number): number[] {
-  validateMaskId(maskId);
-  const slots = dataCellSlots();
-  return symbols.map((symbol, index) => modulo(symbol + maskDelta(maskId, slots[index].row, slots[index].column), LAB_RADIX));
-}
-
-export function removeSymbolMask(symbols: readonly (number | null)[], maskId: number): Array<number | null> {
-  validateMaskId(maskId);
-  const slots = dataCellSlots();
-  return symbols.map((symbol, index) => symbol === null
-    ? null
-    : modulo(symbol - maskDelta(maskId, slots[index].row, slots[index].column), LAB_RADIX));
-}
-
-export function selectVisualMask(
-  unmaskedSymbols: readonly number[],
-  previousDisplayedSymbols: readonly number[] | null = null,
-): Readonly<{ maskId: number; score: number }> {
-  let best = { maskId: 0, score: Number.NEGATIVE_INFINITY };
-  for (let maskId = 0; maskId < 16; maskId += 1) {
-    const displayed = applySymbolMask(unmaskedSymbols, maskId);
-    const score = scoreDisplayedSymbols(displayed, previousDisplayedSymbols);
-    if (score > best.score) best = { maskId, score };
-  }
-  return best;
+export function moduleCenter(cell: Pick<IntegratedCell, "row" | "column">): Point {
+  return {
+    x: LAB_FRAME.qrX + ((cell.column + 0.5) * LAB_FRAME.modulePitch),
+    y: LAB_FRAME.qrY + ((cell.row + 0.5) * LAB_FRAME.modulePitch),
+  };
 }
 
 export function buildBootstrapUrl(origin: string, frame: DynamicLabFrame): string {
@@ -355,7 +414,7 @@ export function parseBootstrapUrl(value: string, expectedOrigin?: string): Boots
   if (!secureOrigin || (expectedOrigin && url.origin !== expectedOrigin) || url.pathname !== "/optical-lab" || url.searchParams.get("role") !== "reader") {
     throw new Error("bootstrap URL is not an accepted optical-lab origin");
   }
-  const match = url.hash.match(/^#PRISM-DYN2\.([0-9a-f]{16})\.([0-9a-z]+)\.([0-9a-f])$/);
+  const match = url.hash.match(/^#PRISM-IQR1\.([0-9a-f]{16})\.([0-9a-z]+)\.([0-9a-f])$/);
   if (!match) throw new Error("bootstrap control header is invalid");
   const sequence = Number.parseInt(match[2], 36);
   const maskId = Number.parseInt(match[3], 16);
@@ -441,40 +500,26 @@ export class DynamicLabDecoder {
   }
 }
 
-export function dataCellCoordinates(): Point[] {
-  return dataCellSlots().map(({ x, y }) => ({ x, y }));
+export function isDarkPaletteState(state: number): boolean {
+  return state >= 0 && state < LAB_CHROMA_RADIX;
 }
 
-export function pilotCoordinates(tileColumn: number, tileRow: number): Array<Point & { symbol: number }> {
-  return PILOTS.map(({ x, y, symbol }) => ({
-    x: LAB_FRAME.dataX + ((tileColumn * LAB_FRAME.tileSize + x + 0.5) * LAB_FRAME.cellPitch),
-    y: LAB_FRAME.dataY + ((tileRow * LAB_FRAME.tileSize + y + 0.5) * LAB_FRAME.cellPitch),
-    symbol,
-  }));
-}
-
-export function calibrationCoordinates(): Array<Point & { symbol: number }> {
-  const coordinates: Array<Point & { symbol: number }> = [];
-  for (let row = 0; row < LAB_FRAME.calibrationRows; row += 1) {
-    for (let column = 0; column < LAB_FRAME.calibrationColumns; column += 1) {
-      coordinates.push({
-        x: LAB_FRAME.calibrationX + ((column + 0.5) * LAB_FRAME.calibrationPitch),
-        y: LAB_FRAME.calibrationY + ((row + 0.5) * LAB_FRAME.calibrationPitch),
-        symbol: (column + row) % LAB_RADIX,
-      });
-    }
-  }
-  return coordinates;
+export function relativeLuminance(rgb: Rgb): number {
+  const linear = rgb.map((channel) => {
+    const value = channel / 255;
+    return value <= 0.04045 ? value / 12.92 : ((value + 0.055) / 1.055) ** 2.4;
+  });
+  return (0.2126 * linear[0]) + (0.7152 * linear[1]) + (0.0722 * linear[2]);
 }
 
 export function estimatePalette(samples: readonly (readonly Rgb[])[]): PaletteModel {
-  if (samples.length !== LAB_RADIX || samples.some((group) => group.length === 0)) {
-    throw new Error("all six C6 calibration states need observed samples");
+  if (samples.length !== LAB_PALETTE_SIZE || samples.some((group) => group.length === 0)) {
+    throw new Error("all eight integrated palette states need observed samples");
   }
   const means = samples.map((group) => meanRgb(group));
   for (let first = 0; first < means.length; first += 1) {
     for (let second = first + 1; second < means.length; second += 1) {
-      if (euclideanDistance(means[first], means[second]) < 24) throw new Error("observed C6 palette separation is too low");
+      if (deltaE(means[first], means[second]) < 18) throw new Error("observed integrated palette separation is too low");
     }
   }
   const inverseVariances = samples.map((group, symbol) => {
@@ -489,11 +534,13 @@ export function estimatePalette(samples: readonly (readonly Rgb[])[]): PaletteMo
 }
 
 export function localizePalette(globalModel: PaletteModel, pilots: readonly Rgb[]): PaletteModel {
-  if (pilots.length !== LAB_RADIX || globalModel.means.length !== LAB_RADIX) throw new Error("a C6 tile needs six local pilot observations");
+  if (pilots.length !== LAB_PALETTE_SIZE || globalModel.means.length !== LAB_PALETTE_SIZE) {
+    throw new Error("an integrated tile needs eight local pilot observations");
+  }
   const shift: [number, number, number] = [0, 0, 0];
-  for (let symbol = 0; symbol < LAB_RADIX; symbol += 1) {
+  for (let symbol = 0; symbol < LAB_PALETTE_SIZE; symbol += 1) {
     for (let channel = 0; channel < 3; channel += 1) {
-      shift[channel] += (pilots[symbol][channel] - globalModel.means[symbol][channel]) / LAB_RADIX;
+      shift[channel] += (pilots[symbol][channel] - globalModel.means[symbol][channel]) / LAB_PALETTE_SIZE;
     }
   }
   const means = pilots.map((pilot, symbol) => [0, 1, 2].map((channel) => (
@@ -565,16 +612,107 @@ export function crc32(bytes: Uint8Array): number {
   return (crc ^ 0xffffffff) >>> 0;
 }
 
-function buildUnmaskedGridSymbols(frame: DynamicLabFrame): number[] {
-  const packetSymbols = encodeBytesToRadix6(frame.bytes);
+function selectIntegratedPilots(bits: Uint8Array, reserved: Uint8Array, size: number): IntegratedPilot[] {
+  const pilots: IntegratedPilot[] = [];
+  const tileCount = Math.ceil(size / LAB_FRAME.tileSize);
+  for (let tileRow = 0; tileRow < tileCount; tileRow += 1) {
+    for (let tileColumn = 0; tileColumn < tileCount; tileColumn += 1) {
+      const dark: IntegratedCell[] = [];
+      const light: IntegratedCell[] = [];
+      const rowStart = tileRow * LAB_FRAME.tileSize;
+      const columnStart = tileColumn * LAB_FRAME.tileSize;
+      for (let row = rowStart; row < Math.min(size, rowStart + LAB_FRAME.tileSize); row += 1) {
+        for (let column = columnStart; column < Math.min(size, columnStart + LAB_FRAME.tileSize); column += 1) {
+          const cell = createCell(row, column, size);
+          if (reserved[cell.index]) continue;
+          (bits[cell.index] ? dark : light).push(cell);
+        }
+      }
+      if (dark.length < PILOTS_PER_LUMINANCE_CLASS || light.length < PILOTS_PER_LUMINANCE_CLASS) continue;
+      dark.sort((left, right) => pilotSelectionKey(left) - pilotSelectionKey(right) || left.index - right.index);
+      light.sort((left, right) => pilotSelectionKey(left) - pilotSelectionKey(right) || left.index - right.index);
+      for (let state = 0; state < PILOTS_PER_LUMINANCE_CLASS; state += 1) {
+        pilots.push({ ...dark[state], paletteState: state });
+        pilots.push({ ...light[state], paletteState: state + LAB_CHROMA_RADIX });
+      }
+    }
+  }
+  if (new Set(pilots.map((pilot) => pilot.paletteState)).size !== LAB_PALETTE_SIZE) {
+    throw new Error("integrated QR cannot place a complete camera-space palette");
+  }
+  return pilots;
+}
+
+function composeIntegratedPalette(matrix: IntegratedQrMatrix, maskedSymbols: readonly number[]): Uint8Array {
+  const states = Uint8Array.from(matrix.bits, (bit) => bit ? 0 : LAB_CHROMA_RADIX);
+  for (const pilot of matrix.pilots) states[pilot.index] = pilot.paletteState;
+  matrix.payloadCells.forEach((cell, index) => {
+    const chroma = maskedSymbols[index];
+    states[cell.index] = matrix.bits[cell.index] ? chroma : chroma + LAB_CHROMA_RADIX;
+  });
+  return states;
+}
+
+function buildUnmaskedPayloadSymbols(frame: DynamicLabFrame, capacity: number): number[] {
+  const packetSymbols = encodeBytesToQuaternary(frame.bytes);
   const symbols = [...packetSymbols, ...packetSymbols];
-  const capacity = dataCellSlots().length;
   let state = (seedFromBytes(frame.bytes.subarray(8, 16)) ^ frame.sequence ^ 0x639ac3d1) >>> 0;
   while (symbols.length < capacity) {
     state = xorshift32(state);
-    symbols.push(state % LAB_RADIX);
+    symbols.push(state % LAB_CHROMA_RADIX);
   }
   return symbols;
+}
+
+function scorePaletteStates(
+  matrix: IntegratedQrMatrix,
+  states: Uint8Array,
+  previous: readonly number[] | null,
+): number {
+  let score = 0;
+  for (let row = 0; row < matrix.size; row += 1) {
+    for (let column = 0; column < matrix.size; column += 1) {
+      const index = row * matrix.size + column;
+      if (column + 1 < matrix.size) score += paletteDistance(states[index], states[index + 1]);
+      if (row + 1 < matrix.size) score += paletteDistance(states[index], states[index + matrix.size]);
+      if (previous && index < previous.length) score += 0.32 * paletteDistance(states[index], previous[index]);
+    }
+  }
+  const counts = new Array<number>(LAB_PALETTE_SIZE).fill(0);
+  for (const cell of matrix.payloadCells) counts[states[cell.index]] += 1;
+  const darkTotal = counts.slice(0, 4).reduce((sum, value) => sum + value, 0);
+  const lightTotal = counts.slice(4).reduce((sum, value) => sum + value, 0);
+  for (let state = 0; state < LAB_PALETTE_SIZE; state += 1) {
+    const target = (state < 4 ? darkTotal : lightTotal) / 4;
+    score -= Math.abs(counts[state] - target) * 1.2;
+  }
+  return score;
+}
+
+function paletteDistance(first: number, second: number): number {
+  if (first === second) return -120;
+  return deltaE(C8_QR_PALETTE[first], C8_QR_PALETTE[second]);
+}
+
+function deltaE(first: Rgb, second: Rgb): number {
+  const left = rgbToLab(first);
+  const right = rgbToLab(second);
+  return Math.hypot(left[0] - right[0], left[1] - right[1], left[2] - right[2]);
+}
+
+function rgbToLab(rgb: Rgb): [number, number, number] {
+  const linear = rgb.map((channel) => {
+    const value = channel / 255;
+    return value <= 0.04045 ? value / 12.92 : ((value + 0.055) / 1.055) ** 2.4;
+  });
+  const x = ((0.4124564 * linear[0]) + (0.3575761 * linear[1]) + (0.1804375 * linear[2])) / 0.95047;
+  const y = (0.2126729 * linear[0]) + (0.7151522 * linear[1]) + (0.072175 * linear[2]);
+  const z = ((0.0193339 * linear[0]) + (0.119192 * linear[1]) + (0.9503041 * linear[2])) / 1.08883;
+  const convert = (value: number) => value > 0.008856 ? Math.cbrt(value) : (7.787 * value) + (16 / 116);
+  const fx = convert(x);
+  const fy = convert(y);
+  const fz = convert(z);
+  return [(116 * fy) - 16, 500 * (fx - fy), 200 * (fy - fz)];
 }
 
 function repairEquationMask(sessionNonce: Uint8Array, sequence: number): number {
@@ -603,72 +741,42 @@ function xorObjectChunks(object: Uint8Array, equationMask: number): Uint8Array {
   return payload;
 }
 
-function dataCellSlots(): CellSlot[] {
-  const slots: CellSlot[] = [];
-  const tileColumns = LAB_FRAME.dataColumns / LAB_FRAME.tileSize;
-  const tileRows = LAB_FRAME.dataRows / LAB_FRAME.tileSize;
-  for (let tileRow = 0; tileRow < tileRows; tileRow += 1) {
-    for (let tileColumn = 0; tileColumn < tileColumns; tileColumn += 1) {
-      for (let localY = 0; localY < LAB_FRAME.tileSize; localY += 1) {
-        for (let localX = 0; localX < LAB_FRAME.tileSize; localX += 1) {
-          if (PILOT_KEYS.has(`${localX}:${localY}`)) continue;
-          const column = tileColumn * LAB_FRAME.tileSize + localX;
-          const row = tileRow * LAB_FRAME.tileSize + localY;
-          slots.push({
-            column,
-            row,
-            x: LAB_FRAME.dataX + ((column + 0.5) * LAB_FRAME.cellPitch),
-            y: LAB_FRAME.dataY + ((row + 0.5) * LAB_FRAME.cellPitch),
-          });
-        }
-      }
-    }
-  }
-  return slots;
+function createCell(row: number, column: number, size: number): IntegratedCell {
+  return {
+    index: row * size + column,
+    row,
+    column,
+    tileRow: Math.floor(row / LAB_FRAME.tileSize),
+    tileColumn: Math.floor(column / LAB_FRAME.tileSize),
+  };
 }
 
-function scoreDisplayedSymbols(symbols: readonly number[], previous: readonly number[] | null): number {
-  const slots = dataCellSlots();
-  const indexByPosition = new Map(slots.map((slot, index) => [`${slot.column}:${slot.row}`, index]));
-  let score = 0;
-  for (let index = 0; index < slots.length; index += 1) {
-    const slot = slots[index];
-    for (const [column, row] of [[slot.column + 1, slot.row], [slot.column, slot.row + 1]]) {
-      const neighbor = indexByPosition.get(`${column}:${row}`);
-      if (neighbor !== undefined) score += paletteDistance(symbols[index], symbols[neighbor]);
-    }
-    if (previous && index < previous.length) score += 0.38 * paletteDistance(symbols[index], previous[index]);
-  }
-  const counts = new Array<number>(LAB_RADIX).fill(0);
-  for (const symbol of symbols) counts[symbol] += 1;
-  const target = symbols.length / LAB_RADIX;
-  score -= counts.reduce((penalty, count) => penalty + Math.abs(count - target), 0) * 0.8;
-  return score;
+function pilotSelectionKey(cell: IntegratedCell): number {
+  return hash32(Math.imul(cell.row + 1, 0x45d9f3b) ^ Math.imul(cell.column + 1, 0x119de1f3));
 }
 
-function paletteDistance(first: number, second: number): number {
-  const distance = euclideanDistance(C6_PALETTE[first], C6_PALETTE[second]);
-  return first === second ? -90 : distance;
+function cellInterleaveKey(cell: IntegratedCell): number {
+  return hash32(Math.imul(cell.index + 1, 0x9e3779b1));
 }
 
-function maskDelta(maskId: number, row: number, column: number): number {
+function chromaMaskDelta(maskId: number, row: number, column: number): number {
   switch (maskId) {
-    case 0: return (row + column) % 6;
-    case 1: return (2 * row + column) % 6;
-    case 2: return (row + 2 * column) % 6;
-    case 3: return (3 * row + column) % 6;
-    case 4: return (row + 3 * column) % 6;
-    case 5: return ((row * column) + row + column) % 6;
-    case 6: return (Math.floor(row / 2) + column) % 6;
-    case 7: return (row + Math.floor(column / 2)) % 6;
-    case 8: return (Math.floor(row / 3) + 2 * column) % 6;
-    case 9: return (2 * row + Math.floor(column / 3)) % 6;
-    case 10: return ((row * column) + 2 * row + column) % 6;
-    case 11: return ((row * column) + row + 2 * column) % 6;
-    case 12: return ((row % 3) * 2 + column) % 6;
-    case 13: return (row + (column % 3) * 2) % 6;
-    case 14: return (row * row + column) % 6;
-    case 15: return (row + column * column) % 6;
+    case 0: return (row + column) % 4;
+    case 1: return (2 * row + column) % 4;
+    case 2: return (row + 2 * column) % 4;
+    case 3: return (3 * row + column) % 4;
+    case 4: return (row + 3 * column) % 4;
+    case 5: return ((row * column) + row + column) % 4;
+    case 6: return (Math.floor(row / 2) + column) % 4;
+    case 7: return (row + Math.floor(column / 2)) % 4;
+    case 8: return (Math.floor(row / 3) + 2 * column) % 4;
+    case 9: return (2 * row + Math.floor(column / 3)) % 4;
+    case 10: return ((row * column) + 2 * row + column) % 4;
+    case 11: return ((row * column) + row + 2 * column) % 4;
+    case 12: return ((row % 3) * 2 + column) % 4;
+    case 13: return (row + (column % 3) * 2) % 4;
+    case 14: return (row * row + column) % 4;
+    case 15: return (row + column * column) % 4;
     default: throw new Error("mask id is outside the supported table");
   }
 }
@@ -717,6 +825,13 @@ function xorshift32(input: number): number {
   return value >>> 0;
 }
 
+function hash32(input: number): number {
+  let value = input >>> 0;
+  value = Math.imul(value ^ (value >>> 16), 0x45d9f3b);
+  value = Math.imul(value ^ (value >>> 16), 0x45d9f3b);
+  return (value ^ (value >>> 16)) >>> 0;
+}
+
 function modulo(value: number, modulus: number): number {
   return ((value % modulus) + modulus) % modulus;
 }
@@ -726,10 +841,6 @@ function meanRgb(samples: readonly Rgb[]): Rgb {
     sum[0] + rgb[0], sum[1] + rgb[1], sum[2] + rgb[2],
   ], [0, 0, 0]);
   return totals.map((total) => total / samples.length) as [number, number, number];
-}
-
-function euclideanDistance(left: Rgb, right: Rgb): number {
-  return Math.sqrt(left.reduce((sum, channel, index) => sum + ((channel - right[index]) ** 2), 0));
 }
 
 function toHex(bytes: Uint8Array): string {

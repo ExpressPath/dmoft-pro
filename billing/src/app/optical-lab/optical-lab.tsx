@@ -1,26 +1,28 @@
 "use client";
 
 import jsQR from "jsqr";
-import QRCode from "qrcode";
 import { useEffect, useRef, useState } from "react";
 
 import {
-  C6_PALETTE,
+  C8_QR_PALETTE,
   DynamicLabDecoder,
   LAB_FRAME,
+  LAB_OBJECT_BYTES,
+  LAB_PALETTE_SIZE,
   LAB_PROFILE_NAME,
-  LAB_RADIX,
+  LAB_QR_ERROR_CORRECTION,
+  LAB_QR_VERSION,
   LAB_SOURCE_CHUNK_COUNT,
   LAB_TARGET_FPS,
-  buildBootstrapUrl,
   buildLabObject,
-  calibrationCoordinates,
   classifyColor,
-  decodeDynamicGridSymbols,
+  createIntegratedQrMatrix,
+  decodeIntegratedPaletteSymbols,
   estimatePalette,
+  isDarkPaletteState,
   localizePalette,
+  moduleCenter,
   parseBootstrapUrl,
-  pilotCoordinates,
   prepareDynamicFrame,
   projectPoint,
   solveHomography,
@@ -37,7 +39,6 @@ import {
 import styles from "./optical-lab.module.css";
 
 type Role = "sender" | "reader";
-
 type QrCorner = Readonly<{ x: number; y: number }>;
 type QrLocation = Readonly<{
   topLeftCorner: QrCorner;
@@ -50,12 +51,16 @@ type DecodedCameraFrame = Readonly<{
   decoded: FrameGridDecode;
   confidence: number;
   erasures: number;
+  payloadCellCount: number;
 }>;
 
 type SenderMetrics = Readonly<{
   sessionHex: string;
   sequence: number;
   maskId: number;
+  qrMaskPattern: number;
+  payloadCells: number;
+  pilotCells: number;
   frameKind: DynamicLabFrame["frameKind"];
   measuredFps: number;
 }>;
@@ -66,7 +71,7 @@ type ReaderMetrics = Readonly<DecoderProgress & {
   lastFrameKind: DynamicLabFrame["frameKind"] | null;
   confidence: number;
   erasures: number;
-  recommendation: "C6" | "C4" | "BW";
+  recommendation: "C8" | "C4" | "BW";
 }>;
 
 type ReaderSuccess = Readonly<{
@@ -80,7 +85,6 @@ const QR_SOURCE_CORNERS: readonly Point[] = [
   { x: LAB_FRAME.qrX + LAB_FRAME.qrSize, y: LAB_FRAME.qrY + LAB_FRAME.qrSize },
   { x: LAB_FRAME.qrX, y: LAB_FRAME.qrY + LAB_FRAME.qrSize },
 ];
-const PILOT_KEYS = new Set(["0:0", "7:0", "0:7", "7:7", "3:0", "4:7"]);
 const EMPTY_PROGRESS: ReaderMetrics = {
   rank: 0,
   required: LAB_SOURCE_CHUNK_COUNT,
@@ -92,7 +96,7 @@ const EMPTY_PROGRESS: ReaderMetrics = {
   lastFrameKind: null,
   confidence: 0,
   erasures: 0,
-  recommendation: "C6",
+  recommendation: "C8",
 };
 
 export function OpticalLab({ initialRole }: { initialRole: Role }) {
@@ -122,52 +126,62 @@ export function OpticalLab({ initialRole }: { initialRole: Role }) {
 
     let cancelled = false;
     let sequence = 0;
-    let previousSymbols: readonly number[] | null = null;
+    let previousPaletteStates: number[] | null = null;
     let previousRenderTime = performance.now();
     const sessionNonce = new Uint8Array(8);
     crypto.getRandomValues(sessionNonce);
     const object = buildLabObject(sessionNonce);
 
-    const renderNext = async () => {
-      const started = performance.now();
-      const prepared = prepareDynamicFrame(sessionNonce, object.bytes, sequence, previousSymbols);
-      const bootstrap = buildBootstrapUrl(window.location.origin, prepared.frame);
-      await renderSenderFrame(canvas, prepared, bootstrap);
-      if (cancelled) return;
+    const renderNext = () => {
+      try {
+        const started = performance.now();
+        const prepared = prepareDynamicFrame(
+          sessionNonce,
+          object.bytes,
+          sequence,
+          window.location.origin,
+          previousPaletteStates,
+        );
+        renderSenderFrame(canvas, prepared);
+        if (cancelled) return;
 
-      if (sequence === 0) {
-        try {
-          const verified = verifyRenderedFrame(canvas);
-          setSenderSelfTest(
-            verified.decoded.frame.sessionHex === prepared.frame.sessionHex
-              && verified.decoded.frame.sequence === prepared.frame.sequence
-              ? "QR + C6 + CRC32 OK"
-              : "FAILED",
-          );
-        } catch {
-          setSenderSelfTest("FAILED");
+        if (sequence === 0) {
+          try {
+            const verified = verifyRenderedFrame(canvas);
+            setSenderSelfTest(
+              verified.decoded.frame.sessionHex === prepared.frame.sessionHex
+                && verified.decoded.frame.sequence === prepared.frame.sequence
+                ? "QR luminance + C8 chroma + CRC32 OK"
+                : "FAILED",
+            );
+          } catch {
+            setSenderSelfTest("FAILED");
+          }
         }
-      }
 
-      const now = performance.now();
-      const measuredFps = 1000 / Math.max(1, now - previousRenderTime);
-      previousRenderTime = now;
-      setSenderMetrics({
-        sessionHex: prepared.frame.sessionHex,
-        sequence: prepared.frame.sequence,
-        maskId: prepared.frame.maskId,
-        frameKind: prepared.frame.frameKind,
-        measuredFps,
-      });
-      previousSymbols = prepared.displayedSymbols;
-      sequence = (sequence + 1) & 0xffff;
-      const wait = Math.max(0, (1000 / LAB_TARGET_FPS) - (performance.now() - started));
-      senderTimerRef.current = setTimeout(() => void renderNext(), wait);
+        const now = performance.now();
+        const measuredFps = 1000 / Math.max(1, now - previousRenderTime);
+        previousRenderTime = now;
+        setSenderMetrics({
+          sessionHex: prepared.frame.sessionHex,
+          sequence: prepared.frame.sequence,
+          maskId: prepared.frame.maskId,
+          qrMaskPattern: prepared.matrix.qrMaskPattern,
+          payloadCells: prepared.matrix.payloadCells.length,
+          pilotCells: prepared.matrix.pilots.length,
+          frameKind: prepared.frame.frameKind,
+          measuredFps,
+        });
+        previousPaletteStates = Array.from(prepared.paletteStates);
+        sequence = (sequence + 1) & 0xffff;
+        const wait = Math.max(0, (1000 / LAB_TARGET_FPS) - (performance.now() - started));
+        senderTimerRef.current = setTimeout(renderNext, wait);
+      } catch {
+        if (!cancelled) setSenderSelfTest("FAILED");
+      }
     };
 
-    void renderNext().catch(() => {
-      if (!cancelled) setSenderSelfTest("FAILED");
-    });
+    senderTimerRef.current = setTimeout(renderNext, 0);
     return () => {
       cancelled = true;
       if (senderTimerRef.current) clearTimeout(senderTimerRef.current);
@@ -214,8 +228,8 @@ export function OpticalLab({ initialRole }: { initialRole: Role }) {
         audio: false,
         video: {
           facingMode: { ideal: "environment" },
-          width: { ideal: 1280 },
-          height: { ideal: 720 },
+          width: { ideal: 1920 },
+          height: { ideal: 1080 },
         },
       });
       const video = videoRef.current;
@@ -230,7 +244,7 @@ export function OpticalLab({ initialRole }: { initialRole: Role }) {
       diagnosticFrameRef.current = 0;
       lastScanTimeRef.current = 0;
       setCameraActive(true);
-      setReaderStatus("動的C6フレームを探索中です。白いフレーム全体を映してください。");
+      setReaderStatus("一体型Dynamic QRを探索中です。正方形全体とquiet zoneを映してください。");
       animationFrameRef.current = requestAnimationFrame(scanCamera);
     } catch (error) {
       const name = error instanceof DOMException ? error.name : "";
@@ -256,7 +270,7 @@ export function OpticalLab({ initialRole }: { initialRole: Role }) {
     const sourceWidth = video.videoWidth;
     const sourceHeight = video.videoHeight;
     if (sourceWidth === 0 || sourceHeight === 0) return;
-    const scale = Math.min(1, 1280 / sourceWidth);
+    const scale = Math.min(1, 1600 / sourceWidth);
     canvas.width = Math.max(1, Math.round(sourceWidth * scale));
     canvas.height = Math.max(1, Math.round(sourceHeight * scale));
     const context = canvas.getContext("2d", { willReadFrequently: true });
@@ -267,13 +281,13 @@ export function OpticalLab({ initialRole }: { initialRole: Role }) {
     diagnosticFrameRef.current += 1;
 
     if (!qr) {
-      if (diagnosticFrameRef.current % 12 === 0) setReaderStatus("モノクロ制御QRを探索中です。距離と反射を調整してください。");
+      if (diagnosticFrameRef.current % 12 === 0) setReaderStatus("QR finder/timing/alignmentを探索中です。距離と反射を調整してください。");
       return;
     }
 
     try {
       const control = parseBootstrapUrl(qr.data, window.location.origin);
-      const cameraFrame = decodeCameraImage(imageData, qr.location as QrLocation, control.maskId);
+      const cameraFrame = decodeCameraImage(imageData, qr.location as QrLocation, qr.data);
       assertControlMatchesFrame(control, cameraFrame.decoded.frame);
 
       let decoder = decoderRef.current;
@@ -291,23 +305,23 @@ export function OpticalLab({ initialRole }: { initialRole: Role }) {
         lastFrameKind: cameraFrame.decoded.frame.frameKind,
         confidence: cameraFrame.confidence,
         erasures: cameraFrame.erasures,
-        recommendation: recommendProfile(cameraFrame.confidence, cameraFrame.erasures),
+        recommendation: recommendProfile(cameraFrame.confidence, cameraFrame.erasures, cameraFrame.payloadCellCount),
       };
       setReaderMetrics(metrics);
       setReaderStatus(
-        `フレーム ${cameraFrame.decoded.frame.sequence} を受理 · 独立シンボル ${progress.rank}/${progress.required} · ${cameraFrame.decoded.frame.frameKind}`,
+        `一体型フレーム ${cameraFrame.decoded.frame.sequence} を受理 · 独立シンボル ${progress.rank}/${progress.required} · ${cameraFrame.decoded.frame.frameKind}`,
       );
 
       if (decoder.canRecoverObject()) {
         const object = decoder.reconstruct();
         setReaderSuccess({ object, metrics });
-        stopCamera("動的ストリームを再構築し、オブジェクトCRC32を確認しました。");
+        stopCamera("一体型Dynamic QRストリームを再構築し、オブジェクトCRC32を確認しました。");
       }
     } catch (error) {
       rejectedFramesRef.current += 1;
       if (diagnosticFrameRef.current % 5 === 0) {
-        const detail = error instanceof Error ? error.message : "dynamic color decode failed";
-        setReaderStatus(`制御面を検出。低信頼フレームを破棄して継続中: ${detail}`);
+        const detail = error instanceof Error ? error.message : "integrated color decode failed";
+        setReaderStatus(`QR幾何を検出。低信頼chromaフレームを破棄して継続中: ${detail}`);
       }
     }
   }
@@ -323,11 +337,11 @@ export function OpticalLab({ initialRole }: { initialRole: Role }) {
   return (
     <main className={styles.labMain}>
       <section className={styles.hero} aria-labelledby="lab-title">
-        <p className={styles.eyebrow}>Public optical test · Dynamic stream</p>
-        <h1 id="lab-title">PrismGlyph Dynamic Camera Lab</h1>
+        <p className={styles.eyebrow}>One QR-family symbol · Dynamic multicolor</p>
+        <h1 id="lab-title">Integrated Dynamic Color QR Lab</h1>
         <p>
-          モノクロ制御面と6色データ面を毎秒更新し、複数フレームから192-byteのテストオブジェクトを復元します。
-          映像・画像・復元データはブラウザの外へ送信されません。
+          QRと色パネルを並べる方式ではありません。1つの正方形QR格子のfinder・timing・alignment・quiet zoneを維持し、
+          同じdata moduleへ黒・白を含む8色の動的chroma情報を重ね、{LAB_OBJECT_BYTES.toLocaleString()}-byteを複数フレームで復元します。
         </p>
       </section>
 
@@ -338,7 +352,7 @@ export function OpticalLab({ initialRole }: { initialRole: Role }) {
           onClick={() => selectRole("sender")}
           aria-pressed={role === "sender"}
         >
-          PCで動的ストリーム表示
+          PCで一体型コード表示
         </button>
         <button
           className={role === "reader" ? styles.activeRole : ""}
@@ -354,15 +368,15 @@ export function OpticalLab({ initialRole }: { initialRole: Role }) {
         <section className={styles.workspace} aria-labelledby="sender-title">
           <div className={styles.workspaceHeader}>
             <div>
-              <p className={styles.step}>PC · DYNAMIC SENDER</p>
-              <h2 id="sender-title">変化するフレーム全体をスマホへ向ける</h2>
+              <p className={styles.step}>PC · INTEGRATED SENDER</p>
+              <h2 id="sender-title">この1つの動的カラーQR全体を映す</h2>
             </div>
             <span className={styles.profileBadge}>{LAB_PROFILE_NAME}</span>
           </div>
           <ol className={styles.instructions}>
-            <li>スマホの標準カメラで左側のモノクロQRを読み、表示されたリンクを開きます。</li>
-            <li>スマホ側で「カメラを開始」を押し、QR・色セル・校正帯を同時に映します。</li>
-            <li>途中のrepairフレームから開始しても、独立した式が8本集まれば復元できます。</li>
+            <li>同じ正方形コードをスマホ標準カメラで読み、readerリンクを開きます。</li>
+            <li>readerで「カメラを開始」を押し、4-module quiet zoneを含む正方形全体を映します。</li>
+            <li>黒白のQR輝度面が幾何とbootstrapを、同じmodule内の8色chroma面が動的データを運びます。</li>
           </ol>
           <div className={styles.frameShell}>
             <canvas
@@ -371,31 +385,34 @@ export function OpticalLab({ initialRole }: { initialRole: Role }) {
               height={LAB_FRAME.height}
               className={styles.senderCanvas}
               role="img"
-              aria-label="動的モノクロ制御QR、6色データセル、局所校正パイロットを含むPrismGlyphテストストリーム"
+              aria-label="finder、timing、alignmentと黒白を含む8色動的payloadを一体化した単一正方形QRコード"
             />
           </div>
           <div className={styles.metrics} aria-live="polite">
             <span>Frame <strong>{senderMetrics?.sequence ?? "…"}</strong></span>
             <span>Mode <strong>{senderMetrics?.frameKind ?? "…"}</strong></span>
-            <span>Mask <strong>{senderMetrics?.maskId ?? "…"} / 15</strong></span>
+            <span>Chroma mask <strong>{senderMetrics?.maskId ?? "…"} / 15</strong></span>
+            <span>QR mask <strong>{senderMetrics?.qrMaskPattern ?? "…"} / 7</strong></span>
             <span>Rate <strong>{senderMetrics ? senderMetrics.measuredFps.toFixed(1) : "…"} FPS</strong></span>
-            <span>Palette <strong>6 colors · base-6</strong></span>
-            <span>Tile pilots <strong>6 / 8×8</strong></span>
-            <span>Core ratio <strong>0.75</strong></span>
+            <span>QR base <strong>V{LAB_QR_VERSION} / {LAB_QR_ERROR_CORRECTION}</strong></span>
+            <span>Palette <strong>8 states · black/white included</strong></span>
+            <span>Payload <strong>2 chroma bits / module</strong></span>
+            <span>Usable modules <strong>{senderMetrics?.payloadCells ?? "…"}</strong></span>
+            <span>Integrated pilots <strong>{senderMetrics?.pilotCells ?? "…"}</strong></span>
             <span>Self-test <strong>{senderSelfTest}</strong></span>
             <span>Session <strong>{senderMetrics?.sessionHex ?? "生成中…"}</strong></span>
           </div>
           <p className={styles.algorithmNote}>
-            実装中の外部FECはRaptorQではなく、系統シンボル＋GF(2) XOR repairの検証用ストリームです。
-            各フレームはsession・sequence・mask・equation・object CRCを自己記述します。
+            Function moduleは純粋な黒白のまま保持します。Data moduleはQR bitがdarkなら黒・赤・濃緑・青、lightなら白・黄・cyan・magentaから選択し、
+            CIE Lab色差・同色隣接・時間遷移を評価して16個の可逆maskから最良を選びます。独立した校正帯や別QRはありません。
           </p>
         </section>
       ) : (
         <section className={styles.workspace} aria-labelledby="reader-title">
           <div className={styles.workspaceHeader}>
             <div>
-              <p className={styles.step}>PHONE · STARTLESS RECEIVER</p>
-              <h2 id="reader-title">ライブカメラで複数フレーム復元</h2>
+              <p className={styles.step}>PHONE · INTEGRATED RECEIVER</p>
+              <h2 id="reader-title">1つのQR格子から幾何・色・動的FECを復元</h2>
             </div>
             <span className={styles.localBadge}>LOCAL ONLY</span>
           </div>
@@ -407,7 +424,7 @@ export function OpticalLab({ initialRole }: { initialRole: Role }) {
               autoPlay
               muted
               playsInline
-              aria-label="PrismGlyph動的フレーム読取用ライブカメラ"
+              aria-label="一体型Dynamic Color QR読取用ライブカメラ"
             />
             <div className={styles.cameraGuide} aria-hidden="true" />
             {!cameraActive ? <p className={styles.cameraPlaceholder}>カメラ停止中</p> : null}
@@ -438,7 +455,7 @@ export function OpticalLab({ initialRole }: { initialRole: Role }) {
 
           {readerSuccess ? (
             <div className={styles.successPanel} role="status">
-              <p className={styles.successMark}>STARTLESS STREAM · OBJECT CRC32 VERIFIED</p>
+              <p className={styles.successMark}>INTEGRATED QR STREAM · OBJECT CRC32 VERIFIED</p>
               <h3>{readerSuccess.object.message}</h3>
               <dl>
                 <div><dt>Session</dt><dd>{readerSuccess.object.sessionHex}</dd></div>
@@ -451,8 +468,8 @@ export function OpticalLab({ initialRole }: { initialRole: Role }) {
             </div>
           ) : null}
           <p className={styles.privacyNote}>
-            低信頼セルはerasureとして扱い、CRC不一致フレームは蓄積しません。カメラはボタン操作後だけ開始し、
-            停止・成功・ページ離脱時に解放します。これは光学・FEC検証であり、暗号認証テストではありません。
+            QR輝度classと矛盾する色、低信頼色、CRC不一致フレームはerasureまたはdropとして扱います。
+            これは光学・FEC検証であり、暗号認証テストではありません。
           </p>
         </section>
       )}
@@ -460,11 +477,7 @@ export function OpticalLab({ initialRole }: { initialRole: Role }) {
   );
 }
 
-async function renderSenderFrame(
-  canvas: HTMLCanvasElement,
-  prepared: PreparedDynamicFrame,
-  bootstrap: string,
-) {
+function renderSenderFrame(canvas: HTMLCanvasElement, prepared: PreparedDynamicFrame) {
   const renderCanvas = document.createElement("canvas");
   renderCanvas.width = LAB_FRAME.width;
   renderCanvas.height = LAB_FRAME.height;
@@ -472,54 +485,19 @@ async function renderSenderFrame(
   if (!context) throw new Error("2D canvas is unavailable");
   context.fillStyle = "#ffffff";
   context.fillRect(0, 0, renderCanvas.width, renderCanvas.height);
-  context.strokeStyle = "#000000";
-  context.lineWidth = 8;
-  context.strokeRect(12, 12, renderCanvas.width - 24, renderCanvas.height - 24);
 
-  const qrCanvas = document.createElement("canvas");
-  await QRCode.toCanvas(qrCanvas, bootstrap, {
-    width: LAB_FRAME.qrSize,
-    margin: 0,
-    errorCorrectionLevel: "H",
-    color: { dark: "#000000", light: "#ffffff" },
-  });
-  context.drawImage(qrCanvas, LAB_FRAME.qrX, LAB_FRAME.qrY, LAB_FRAME.qrSize, LAB_FRAME.qrSize);
-
-  let dataIndex = 0;
-  const tileColumns = LAB_FRAME.dataColumns / LAB_FRAME.tileSize;
-  const tileRows = LAB_FRAME.dataRows / LAB_FRAME.tileSize;
-  for (let tileRow = 0; tileRow < tileRows; tileRow += 1) {
-    for (let tileColumn = 0; tileColumn < tileColumns; tileColumn += 1) {
-      const pilots = new Map(pilotCoordinates(tileColumn, tileRow).map((pilot) => [
-        `${Math.floor((pilot.x - LAB_FRAME.dataX) / LAB_FRAME.cellPitch)}:${Math.floor((pilot.y - LAB_FRAME.dataY) / LAB_FRAME.cellPitch)}`,
-        pilot.symbol,
-      ]));
-      for (let localY = 0; localY < LAB_FRAME.tileSize; localY += 1) {
-        for (let localX = 0; localX < LAB_FRAME.tileSize; localX += 1) {
-          const column = tileColumn * LAB_FRAME.tileSize + localX;
-          const row = tileRow * LAB_FRAME.tileSize + localY;
-          const pilotSymbol = pilots.get(`${column}:${row}`);
-          const symbol = pilotSymbol ?? prepared.displayedSymbols[dataIndex++];
-          paintColorCell(
-            context,
-            LAB_FRAME.dataX + column * LAB_FRAME.cellPitch,
-            LAB_FRAME.dataY + row * LAB_FRAME.cellPitch,
-            LAB_FRAME.cellPitch,
-            symbol,
-          );
-        }
-      }
+  for (let row = 0; row < prepared.matrix.size; row += 1) {
+    for (let column = 0; column < prepared.matrix.size; column += 1) {
+      const state = prepared.paletteStates[(row * prepared.matrix.size) + column];
+      const [red, green, blue] = C8_QR_PALETTE[state];
+      context.fillStyle = `rgb(${red} ${green} ${blue})`;
+      context.fillRect(
+        LAB_FRAME.qrX + (column * LAB_FRAME.modulePitch),
+        LAB_FRAME.qrY + (row * LAB_FRAME.modulePitch),
+        LAB_FRAME.modulePitch,
+        LAB_FRAME.modulePitch,
+      );
     }
-  }
-
-  for (const calibration of calibrationCoordinates()) {
-    paintColorCell(
-      context,
-      calibration.x - LAB_FRAME.calibrationPitch / 2,
-      calibration.y - LAB_FRAME.calibrationPitch / 2,
-      LAB_FRAME.calibrationPitch,
-      calibration.symbol,
-    );
   }
 
   if (canvas.width !== LAB_FRAME.width) canvas.width = LAB_FRAME.width;
@@ -529,17 +507,8 @@ async function renderSenderFrame(
   visibleContext.drawImage(renderCanvas, 0, 0);
 }
 
-function paintColorCell(context: CanvasRenderingContext2D, x: number, y: number, pitch: number, symbol: number) {
-  context.fillStyle = "#ffffff";
-  context.fillRect(x, y, pitch, pitch);
-  const core = pitch * LAB_FRAME.coloredCoreRatio;
-  const inset = (pitch - core) / 2;
-  const [red, green, blue] = C6_PALETTE[symbol];
-  context.fillStyle = `rgb(${red} ${green} ${blue})`;
-  context.fillRect(x + inset, y + inset, core, core);
-}
-
-function decodeCameraImage(image: ImageData, location: QrLocation, maskId: number): DecodedCameraFrame {
+function decodeCameraImage(image: ImageData, location: QrLocation, bootstrap: string): DecodedCameraFrame {
+  const matrix = createIntegratedQrMatrix(bootstrap);
   const destination = [
     location.topLeftCorner,
     location.topRightCorner,
@@ -549,47 +518,51 @@ function decodeCameraImage(image: ImageData, location: QrLocation, maskId: numbe
   const homography = solveHomography(QR_SOURCE_CORNERS, destination);
   const observedQrWidth = distance(location.topLeftCorner, location.topRightCorner);
   const sampleRadius = Math.max(1, Math.min(5, Math.round(
-    (observedQrWidth / LAB_FRAME.qrSize) * LAB_FRAME.cellPitch * 0.12,
+    (observedQrWidth / LAB_FRAME.qrSize) * LAB_FRAME.modulePitch * 0.2,
   )));
 
-  const calibrationSamples: Rgb[][] = Array.from({ length: LAB_RADIX }, () => []);
-  for (const calibration of calibrationCoordinates()) {
-    calibrationSamples[calibration.symbol].push(sampleRgb(image, projectPoint(homography, calibration), sampleRadius));
+  const globalSamples: Rgb[][] = Array.from({ length: LAB_PALETTE_SIZE }, () => []);
+  const tileSamples = new Map<string, Map<number, Rgb>>();
+  for (const pilot of matrix.pilots) {
+    const observed = sampleRgb(image, projectPoint(homography, moduleCenter(pilot)), sampleRadius);
+    globalSamples[pilot.paletteState].push(observed);
+    const key = tileKey(pilot.tileRow, pilot.tileColumn);
+    const group = tileSamples.get(key) ?? new Map<number, Rgb>();
+    group.set(pilot.paletteState, observed);
+    tileSamples.set(key, group);
   }
-  const globalPalette = estimatePalette(calibrationSamples);
-  const symbols: Array<number | null> = [];
+  const globalPalette = estimatePalette(globalSamples);
+  const localModels = new Map<string, ReturnType<typeof localizePalette>>();
+  for (const [key, samples] of tileSamples) {
+    if (samples.size !== LAB_PALETTE_SIZE) continue;
+    localModels.set(key, localizePalette(
+      globalPalette,
+      Array.from({ length: LAB_PALETTE_SIZE }, (_, state) => samples.get(state) as Rgb),
+    ));
+  }
+
+  const observedStates: Array<number | null> = [];
   const confidences: number[] = [];
   let erasures = 0;
-  const tileColumns = LAB_FRAME.dataColumns / LAB_FRAME.tileSize;
-  const tileRows = LAB_FRAME.dataRows / LAB_FRAME.tileSize;
-
-  for (let tileRow = 0; tileRow < tileRows; tileRow += 1) {
-    for (let tileColumn = 0; tileColumn < tileColumns; tileColumn += 1) {
-      const pilots = pilotCoordinates(tileColumn, tileRow).map((pilot) => (
-        sampleRgb(image, projectPoint(homography, pilot), sampleRadius)
-      ));
-      const localPalette = localizePalette(globalPalette, pilots);
-      for (let localY = 0; localY < LAB_FRAME.tileSize; localY += 1) {
-        for (let localX = 0; localX < LAB_FRAME.tileSize; localX += 1) {
-          if (PILOT_KEYS.has(`${localX}:${localY}`)) continue;
-          const logical = {
-            x: LAB_FRAME.dataX + ((tileColumn * LAB_FRAME.tileSize + localX + 0.5) * LAB_FRAME.cellPitch),
-            y: LAB_FRAME.dataY + ((tileRow * LAB_FRAME.tileSize + localY + 0.5) * LAB_FRAME.cellPitch),
-          };
-          const classified = classifyColor(sampleRgb(image, projectPoint(homography, logical), sampleRadius), localPalette);
-          confidences.push(classified.confidence);
-          if (classified.erasure) erasures += 1;
-          symbols.push(classified.erasure ? null : classified.symbol);
-        }
-      }
-    }
+  for (const cell of matrix.payloadCells) {
+    const model = localModels.get(tileKey(cell.tileRow, cell.tileColumn)) ?? globalPalette;
+    const classified = classifyColor(
+      sampleRgb(image, projectPoint(homography, moduleCenter(cell)), sampleRadius),
+      model,
+    );
+    const luminanceMismatch = isDarkPaletteState(classified.symbol) !== (matrix.bits[cell.index] === 1);
+    const erasure = classified.erasure || luminanceMismatch;
+    confidences.push(classified.confidence);
+    if (erasure) erasures += 1;
+    observedStates.push(erasure ? null : classified.symbol);
   }
 
-  const decoded = decodeDynamicGridSymbols(symbols, maskId);
+  const control = parseBootstrapUrl(bootstrap, window.location.origin);
+  const decoded = decodeIntegratedPaletteSymbols(observedStates, matrix, control.maskId);
   const confidence = confidences.length === 0
     ? 0
     : confidences.reduce((sum, value) => sum + value, 0) / confidences.length;
-  return { decoded, confidence, erasures };
+  return { decoded, confidence, erasures, payloadCellCount: matrix.payloadCells.length };
 }
 
 function verifyRenderedFrame(canvas: HTMLCanvasElement): DecodedCameraFrame {
@@ -597,24 +570,28 @@ function verifyRenderedFrame(canvas: HTMLCanvasElement): DecodedCameraFrame {
   if (!context) throw new Error("2D canvas is unavailable");
   const image = context.getImageData(0, 0, canvas.width, canvas.height);
   const qr = jsQR(image.data, image.width, image.height, { inversionAttempts: "dontInvert" });
-  if (!qr) throw new Error("rendered bootstrap QR did not self-decode");
+  if (!qr) throw new Error("integrated QR luminance plane did not self-decode");
   const control = parseBootstrapUrl(qr.data, window.location.origin);
-  const decoded = decodeCameraImage(image, qr.location as QrLocation, control.maskId);
+  const decoded = decodeCameraImage(image, qr.location as QrLocation, qr.data);
   assertControlMatchesFrame(control, decoded.decoded.frame);
   return decoded;
 }
 
 function assertControlMatchesFrame(control: BootstrapControl, frame: DynamicLabFrame) {
   if (control.sessionHex !== frame.sessionHex || control.sequence !== frame.sequence || control.maskId !== frame.maskId) {
-    throw new Error("monochrome control header and C6 payload disagree");
+    throw new Error("integrated QR control and chroma payload disagree");
   }
 }
 
-function recommendProfile(confidence: number, erasures: number): "C6" | "C4" | "BW" {
-  const erasureRate = erasures / 522;
+function recommendProfile(confidence: number, erasures: number, payloadCells: number): "C8" | "C4" | "BW" {
+  const erasureRate = erasures / Math.max(1, payloadCells);
   if (erasureRate > 0.15 || confidence < 2.5) return "BW";
   if (erasureRate > 0.08 || confidence < 5) return "C4";
-  return "C6";
+  return "C8";
+}
+
+function tileKey(tileRow: number, tileColumn: number): string {
+  return `${tileRow}:${tileColumn}`;
 }
 
 function sampleRgb(image: ImageData, point: Point, radius: number): Rgb {
@@ -625,7 +602,7 @@ function sampleRgb(image: ImageData, point: Point, radius: number): Rgb {
     || centerY - radius < 0
     || centerX + radius >= image.width
     || centerY + radius >= image.height
-  ) throw new Error("カラー領域がカメラ画面から外れています");
+  ) throw new Error("一体型QR領域がカメラ画面から外れています");
   let red = 0;
   let green = 0;
   let blue = 0;

@@ -116,11 +116,11 @@
 
 .senderCanvas {
   display: block;
-  width: min(100%, 920px);
+  width: min(100%, 780px);
   height: auto;
   margin-inline: auto;
   background: #fff;
-  image-rendering: auto;
+  image-rendering: pixelated;
 }
 
 .metrics {

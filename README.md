@@ -20,6 +20,11 @@ content off the local device.
   license refresh, and customer-portal service.
 - `docs/`: product boundary, architecture, commercial model, and operations.
 
+The public browser experiment uses one integrated QR-family matrix rather than
+a QR beside a separate color panel. Its luminance/chroma invariants and current
+capacity are specified in
+[the integrated Dynamic Color QR profile](docs/design/INTEGRATED_DYNAMIC_COLOR_QR.md).
+
 ## Community and Pro boundary
 
 | Capability | Community | Pro |

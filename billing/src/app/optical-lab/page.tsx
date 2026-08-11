@@ -3,8 +3,8 @@ import type { Metadata } from "next";
 import { OpticalLab } from "./optical-lab";
 
 export const metadata: Metadata = {
-  title: "PrismGlyph Dynamic Camera Lab",
-  description: "PC display to phone camera test for a startless dynamic C6 optical stream with systematic and XOR repair frames.",
+  title: "Integrated Dynamic Color QR Lab",
+  description: "A single QR-family matrix combining QR luminance geometry with an eight-state dynamic chroma payload.",
 };
 
 export default async function OpticalLabPage({
