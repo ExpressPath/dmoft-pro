@@ -20,10 +20,12 @@ content off the local device.
   license refresh, and customer-portal service.
 - `docs/`: product boundary, architecture, commercial model, and operations.
 
-The public browser experiment now uses one borderless 60 x 34 dynamic optical
-field. It intentionally drops ordinary QR and Micro QR reader compatibility:
-all 2,040 touching cells carry protected data, while geometry, phase, and color
-references are weak distributed sequences superimposed over the field. The
+The public browser experiment now uses one borderless 2,040-cell dynamic optical
+field. Its default is an affine-triangular sample lattice with full-area
+hexagonal Voronoi cells; a square lattice remains as a measured fallback. It
+intentionally drops ordinary QR and Micro QR reader compatibility: all cells
+carry protected data, while geometry, phase, and color references are weak
+distributed sequences superimposed over the field. The
 implemented modulation profiles contain 8, 16, 24, or 32 states (including
 black and white), use Cauchy-MDS inner repair, and transport real RFC 6330
 RaptorQ packets. Its algorithms and current verification boundary are specified

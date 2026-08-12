@@ -10,7 +10,7 @@ export const FIELD_FRAME = {
   columns: FIELD_COLUMNS,
   rows: FIELD_ROWS,
 } as const;
-export const FIELD_PROFILE_NAME = "PRISM-FIELD-NATIVE-R1";
+export const FIELD_PROFILE_NAME = "PRISM-FIELD-NATIVE-R2";
 export const FIELD_PHASE_COUNT = 16;
 export const FIELD_MASK_COUNT = 16;
 export const FIELD_INNER_DATA_BYTES = 213;
@@ -23,14 +23,36 @@ export const FIELD_TARGET_FPS = 10;
 export const FIELD_ERASURE_THRESHOLD = 2;
 export const FIELD_GEOMETRY_TRACK_MAX_FRAMES = 2;
 export const FIELD_GEOMETRY_TRACK_MAX_AGE_MS = 240;
+const TRI_ROW_PITCH = Math.sqrt(3) / 2;
+const TRI_HEX_RADIUS = 1 / Math.sqrt(3);
+const TRI_ROWS = 36;
+const TRI_EXTRA_ODD_ROWS = new Set([1, 7, 13, 19, 25, 31]);
 
 export type Point = Readonly<{ x: number; y: number }>;
 export type Rgb = Readonly<[number, number, number]>;
 export type FieldProfileId = "C8" | "C16" | "C24" | "C32";
+export type FieldGeometryId = "SQ60" | "TRI57";
 export type FieldCell = Readonly<{
   index: number;
   row: number;
   column: number;
+  center: Point;
+  latticeCenter: Point;
+  neighbours: readonly number[];
+}>;
+export type FieldGeometry = Readonly<{
+  id: FieldGeometryId;
+  code: number;
+  lattice: "square" | "affine-triangular";
+  nominalColumns: number;
+  nominalRows: number;
+  cellCount: number;
+  latticeBounds: Readonly<{ left: number; top: number; width: number; height: number }>;
+  cells: readonly FieldCell[];
+  rows: readonly (readonly number[])[];
+  layout: readonly FieldCell[];
+  minimumCenterDistanceAtReference: number;
+  minimumDistanceGainOverSquare: number;
 }>;
 export type FieldProfile = Readonly<{
   id: FieldProfileId;
@@ -61,6 +83,7 @@ export type NativeFieldFrame = Readonly<{
   phase: number;
   maskId: number;
   profileId: FieldProfileId;
+  geometryId: FieldGeometryId;
   objectLength: number;
   objectCrc: number;
   raptorPacket: Uint8Array;
@@ -83,6 +106,12 @@ export type AdaptiveProfileObservation = Readonly<{
   mutualInformationBits: number;
   frameAcceptance: number;
   processingFps: number;
+}>;
+export type AdaptiveGeometryObservation = Readonly<{
+  geometryId: FieldGeometryId;
+  frameAcceptance: number;
+  processingFps: number;
+  meanCellMutualInformationBits: number;
 }>;
 
 const PALETTE_C8: readonly Rgb[] = [
@@ -111,14 +140,16 @@ export const FIELD_PROFILES: Readonly<Record<FieldProfileId, FieldProfile>> = Ob
   C32: createProfile("C32", 4, 5, PALETTE_C32),
 });
 
-export const FIELD_LAYOUT: readonly FieldCell[] = createInterleavedLayout();
+export const FIELD_GEOMETRIES: Readonly<Record<FieldGeometryId, FieldGeometry>> = createFieldGeometries();
+export const DEFAULT_FIELD_GEOMETRY_ID: FieldGeometryId = "TRI57";
+export const FIELD_LAYOUT: readonly FieldCell[] = FIELD_GEOMETRIES[DEFAULT_FIELD_GEOMETRY_ID].layout;
 export const FIELD_PROTECTED_DENSITY_GAIN_OVER_C16 = (45 * 45) / 1_230;
 export const FIELD_PAYLOAD_FRACTION = 1;
 
 const FRAME_MAGIC = new Uint8Array([0x50, 0x46, 0x4c, 0x44]);
 const OBJECT_MAGIC = new Uint8Array([0x50, 0x46, 0x4f, 0x42]);
-const FIELD_VERSION = 1;
-const OBJECT_MESSAGE = new TextEncoder().encode("PRISM-FIELD-NATIVE-R1-OK");
+const FIELD_VERSION = 2;
+const OBJECT_MESSAGE = new TextEncoder().encode("PRISM-FIELD-NATIVE-R2-OK");
 
 export function buildNativeLabObject(sessionNonce: Uint8Array, profileId: FieldProfileId): NativeLabObject {
   assertSessionNonce(sessionNonce);
@@ -168,17 +199,18 @@ export function prepareNativeFieldFrame(
   raptorPacket: Uint8Array,
   profileId: FieldProfileId,
   previousStates: readonly number[] | null = null,
+  geometryId: FieldGeometryId = DEFAULT_FIELD_GEOMETRY_ID,
 ): PreparedNativeFieldFrame {
   const phase = sequence % FIELD_PHASE_COUNT;
   let selected: PreparedNativeFieldFrame | null = null;
   for (let maskId = 0; maskId < FIELD_MASK_COUNT; maskId += 1) {
-    const frame = buildNativeFieldFrame(sessionNonce, object, sequence, phase, maskId, profileId, raptorPacket);
+    const frame = buildNativeFieldFrame(sessionNonce, object, sequence, phase, maskId, profileId, raptorPacket, geometryId);
     const codeword = encodeInnerCodeword(frame.bytes, FIELD_PROFILES[profileId]);
     const unmasked = encodeCodewordToSymbols(codeword, FIELD_PROFILES[profileId]);
-    const masked = applyFieldMask(unmasked, maskId, FIELD_PROFILES[profileId]);
-    const states = placeInterleavedSymbols(masked);
+    const masked = applyFieldMask(unmasked, maskId, FIELD_PROFILES[profileId], geometryId);
+    const states = placeInterleavedSymbols(masked, geometryId);
     const renderedColors = statesToRenderedColors(states, profileId, phase);
-    const maskScore = scoreFieldStates(states, profileId, previousStates);
+    const maskScore = scoreFieldStates(states, profileId, previousStates, geometryId);
     if (!selected || maskScore > selected.maskScore) selected = { frame, states, renderedColors, maskScore };
   }
   if (!selected) throw new Error("no native field mask could be selected");
@@ -193,10 +225,12 @@ export function buildNativeFieldFrame(
   maskId: number,
   profileId: FieldProfileId,
   raptorPacket: Uint8Array,
+  geometryId: FieldGeometryId = DEFAULT_FIELD_GEOMETRY_ID,
 ): NativeFieldFrame {
   assertSessionNonce(sessionNonce);
   const object = parseNativeLabObject(objectInput);
   const profile = FIELD_PROFILES[profileId];
+  const geometry = fieldGeometry(geometryId);
   if (object.sessionHex !== toHex(sessionNonce) || object.profileId !== profileId) throw new Error("native object and frame profile do not match");
   if (!Number.isSafeInteger(sequence) || sequence < 0 || sequence > 0xffff) throw new Error("native sequence must fit uint16");
   if (!Number.isInteger(phase) || phase < 0 || phase >= FIELD_PHASE_COUNT) throw new Error("native phase is invalid");
@@ -215,9 +249,9 @@ export function buildNativeFieldFrame(
   view.setUint16(20, object.bytes.length, false);
   view.setUint32(22, crc32(object.bytes), false);
   bytes[26] = profile.palette.length;
-  bytes[27] = profile.stripeCount;
-  view.setUint16(28, FIELD_COLUMNS, false);
-  view.setUint16(30, FIELD_ROWS, false);
+  bytes[27] = (geometry.code << 4) | profile.stripeCount;
+  view.setUint16(28, geometry.nominalColumns, false);
+  view.setUint16(30, geometry.nominalRows, false);
   bytes.set(raptorPacket, FIELD_HEADER_BYTES);
   view.setUint32(bytes.length - FIELD_CRC_BYTES, crc32(bytes.subarray(0, -FIELD_CRC_BYTES)), false);
   return parseNativeFieldFrame(bytes);
@@ -228,15 +262,16 @@ export function parseNativeFieldFrame(input: Uint8Array): NativeFieldFrame {
   if (bytes.length < FIELD_HEADER_BYTES + FIELD_CRC_BYTES) throw new Error("native frame is too short");
   assertMagic(bytes, FRAME_MAGIC, "native frame");
   const profile = profileFromCode(bytes[5]);
+  const geometry = geometryFromCode(bytes[27] >>> 4);
   if (bytes.length !== profile.packetBytes || bytes[4] !== FIELD_VERSION) throw new Error("native frame profile is unsupported");
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   if (
     bytes[6] >= FIELD_PHASE_COUNT
     || bytes[7] >= FIELD_MASK_COUNT
     || bytes[26] !== profile.palette.length
-    || bytes[27] !== profile.stripeCount
-    || view.getUint16(28, false) !== FIELD_COLUMNS
-    || view.getUint16(30, false) !== FIELD_ROWS
+    || (bytes[27] & 0x0f) !== profile.stripeCount
+    || view.getUint16(28, false) !== geometry.nominalColumns
+    || view.getUint16(30, false) !== geometry.nominalRows
   ) throw new Error("native distributed control is invalid");
   const expected = view.getUint32(bytes.length - FIELD_CRC_BYTES, false);
   if (crc32(bytes.subarray(0, -FIELD_CRC_BYTES)) !== expected) throw new Error("native frame CRC32 does not match");
@@ -251,6 +286,7 @@ export function parseNativeFieldFrame(input: Uint8Array): NativeFieldFrame {
     phase: bytes[6],
     maskId: bytes[7],
     profileId: profile.id,
+    geometryId: geometry.id,
     objectLength: view.getUint16(20, false),
     objectCrc: view.getUint32(22, false),
     raptorPacket: bytes.slice(FIELD_HEADER_BYTES, FIELD_HEADER_BYTES + packetLength),
@@ -264,16 +300,18 @@ export function decodeNativeFieldSymbols(
   knownPhase: number,
   knownMaskId?: number,
   symbolReliabilities?: readonly number[],
+  geometryId: FieldGeometryId = DEFAULT_FIELD_GEOMETRY_ID,
 ): NativeFieldDecode {
   if (physicalStates.length !== FIELD_CELL_COUNT) throw new Error("native field needs one state per cell");
   const profile = FIELD_PROFILES[profileId];
-  const interleaved = FIELD_LAYOUT.map((cell) => physicalStates[cell.index]);
+  const geometry = fieldGeometry(geometryId);
+  const interleaved = geometry.layout.map((cell) => physicalStates[cell.index]);
   const masks = knownMaskId === undefined ? Array.from({ length: FIELD_MASK_COUNT }, (_, index) => index) : [knownMaskId];
   const valid: NativeFieldDecode[] = [];
   for (const maskId of masks) {
-    const unmasked = removeFieldMask(interleaved, maskId, profile);
+    const unmasked = removeFieldMask(interleaved, maskId, profile, geometryId);
     const optionalCodeword = decodeSymbolsToOptionalCodeword(unmasked, profile);
-    const reliabilityOrders = byteReliabilityOrders(symbolReliabilities, optionalCodeword, profile);
+    const reliabilityOrders = byteReliabilityOrders(symbolReliabilities, optionalCodeword, profile, geometryId);
     const baseErasures = Array.from({ length: profile.stripeCount }, (_, stripe) => (
       optionalCodeword.slice(stripe * profile.innerCodewordBytes, (stripe + 1) * profile.innerCodewordBytes)
         .filter((value) => value === null).length
@@ -297,7 +335,7 @@ export function decodeNativeFieldSymbols(
           reliabilityErasedBytes += count;
         }
         const frame = parseNativeFieldFrame(packet);
-        if (frame.maskId !== maskId || frame.phase !== knownPhase || frame.profileId !== profileId) continue;
+        if (frame.maskId !== maskId || frame.phase !== knownPhase || frame.profileId !== profileId || frame.geometryId !== geometryId) continue;
         valid.push({ frame, correctedByteErasures, reliabilityErasedBytes, inferredMaskId: maskId });
         break;
       } catch {
@@ -356,22 +394,57 @@ export function selectAdaptiveFieldProfile(observations: readonly AdaptiveProfil
   return selected.profileId;
 }
 
-export function applyFieldMask(symbols: readonly number[], maskId: number, profile: FieldProfile): number[] {
+export function selectAdaptiveFieldGeometry(observations: readonly AdaptiveGeometryObservation[]): FieldGeometryId {
+  if (observations.length === 0) return DEFAULT_FIELD_GEOMETRY_ID;
+  let selected = observations[0];
+  let selectedScore = -Infinity;
+  for (const observation of observations) {
+    const geometry = fieldGeometry(observation.geometryId);
+    const score = Math.max(0, observation.meanCellMutualInformationBits)
+      * clamp01(observation.frameAcceptance)
+      * Math.max(0, observation.processingFps);
+    const selectedGeometry = fieldGeometry(selected.geometryId);
+    if (
+      score > selectedScore
+      || (score === selectedScore && geometry.minimumCenterDistanceAtReference > selectedGeometry.minimumCenterDistanceAtReference)
+    ) {
+      selected = observation;
+      selectedScore = score;
+    }
+  }
+  return selected.geometryId;
+}
+
+export function fieldGeometry(id: FieldGeometryId): FieldGeometry {
+  const geometry = FIELD_GEOMETRIES[id];
+  if (!geometry) throw new Error("native field geometry is unsupported");
+  return geometry;
+}
+
+export function applyFieldMask(
+  symbols: readonly number[],
+  maskId: number,
+  profile: FieldProfile,
+  geometryId: FieldGeometryId = DEFAULT_FIELD_GEOMETRY_ID,
+): number[] {
   validateMask(maskId);
   if (symbols.length !== FIELD_CELL_COUNT) throw new Error("field mask needs a full codeword");
-  return symbols.map((symbol, index) => modulo(symbol + fieldMaskDelta(maskId, FIELD_LAYOUT[index], profile.palette.length), profile.palette.length));
+  const layout = fieldGeometry(geometryId).layout;
+  return symbols.map((symbol, index) => modulo(symbol + fieldMaskDelta(maskId, layout[index], profile.palette.length), profile.palette.length));
 }
 
 export function removeFieldMask(
   symbols: readonly (number | null)[],
   maskId: number,
   profile: FieldProfile,
+  geometryId: FieldGeometryId = DEFAULT_FIELD_GEOMETRY_ID,
 ): Array<number | null> {
   validateMask(maskId);
   if (symbols.length !== FIELD_CELL_COUNT) throw new Error("field mask needs a full codeword");
+  const layout = fieldGeometry(geometryId).layout;
   return symbols.map((symbol, index) => symbol === null
     ? null
-    : modulo(symbol - fieldMaskDelta(maskId, FIELD_LAYOUT[index], profile.palette.length), profile.palette.length));
+    : modulo(symbol - fieldMaskDelta(maskId, layout[index], profile.palette.length), profile.palette.length));
 }
 
 export function encodeBytesToSymbols(bytes: Uint8Array, bitsPerCell: number): number[] {
@@ -431,8 +504,52 @@ export function decodeSymbolsToOptionalBytes(symbols: readonly (number | null)[]
   return bytes;
 }
 
-export function logicalFieldCellCenter(cell: Pick<FieldCell, "row" | "column">): Point {
-  return { x: cell.column + 0.5, y: cell.row + 0.5 };
+export function logicalFieldCellCenter(cell: Pick<FieldCell, "center">): Point {
+  return cell.center;
+}
+
+export function createFieldRasterOwners(
+  geometryId: FieldGeometryId,
+  width: number = FIELD_FRAME.width,
+  height: number = FIELD_FRAME.height,
+): Uint16Array {
+  if (!Number.isInteger(width) || width < 1 || !Number.isInteger(height) || height < 1) {
+    throw new Error("native raster dimensions must be positive integers");
+  }
+  const owners = new Uint16Array(width * height);
+  for (let y = 0; y < height; y += 1) {
+    const v = (y + 0.5) / height;
+    for (let x = 0; x < width; x += 1) {
+      owners[(y * width) + x] = nearestFieldCellIndex(geometryId, (x + 0.5) / width, v);
+    }
+  }
+  return owners;
+}
+
+export function nearestFieldCellIndex(geometryId: FieldGeometryId, u: number, v: number): number {
+  const geometry = fieldGeometry(geometryId);
+  if (!Number.isFinite(u) || !Number.isFinite(v)) throw new Error("native raster coordinate is not finite");
+  if (geometry.id === "SQ60") {
+    const column = Math.max(0, Math.min(FIELD_COLUMNS - 1, Math.floor(u * FIELD_COLUMNS)));
+    const row = Math.max(0, Math.min(FIELD_ROWS - 1, Math.floor(v * FIELD_ROWS)));
+    return (row * FIELD_COLUMNS) + column;
+  }
+  const latticeX = geometry.latticeBounds.left + (u * geometry.latticeBounds.width);
+  const latticeY = geometry.latticeBounds.top + (v * geometry.latticeBounds.height);
+  const approximateRow = Math.round((latticeY - TRI_HEX_RADIUS) / TRI_ROW_PITCH);
+  let selected = 0;
+  let selectedDistance = Infinity;
+  for (let row = Math.max(0, approximateRow - 2); row <= Math.min(geometry.rows.length - 1, approximateRow + 2); row += 1) {
+    for (const index of nearestRowCandidates(geometry.rows[row], geometry.cells, latticeX)) {
+      const center = geometry.cells[index].latticeCenter;
+      const distance = ((center.x - latticeX) ** 2) + ((center.y - latticeY) ** 2);
+      if (distance < selectedDistance || (distance === selectedDistance && index < selected)) {
+        selected = index;
+        selectedDistance = distance;
+      }
+    }
+  }
+  return selected;
 }
 
 export function crc32(bytes: Uint8Array): number {
@@ -533,10 +650,10 @@ function decodeSymbolsToOptionalCodeword(
     : decodeSymbolsToOptionalBytes(symbols, profile.bitsPerCell);
 }
 
-function placeInterleavedSymbols(symbols: readonly number[]): Uint8Array {
+function placeInterleavedSymbols(symbols: readonly number[], geometryId: FieldGeometryId): Uint8Array {
   if (symbols.length !== FIELD_CELL_COUNT) throw new Error("native codeword does not fill the complete field");
   const states = new Uint8Array(FIELD_CELL_COUNT);
-  FIELD_LAYOUT.forEach((cell, index) => { states[cell.index] = symbols[index]; });
+  fieldGeometry(geometryId).layout.forEach((cell, index) => { states[cell.index] = symbols[index]; });
   return states;
 }
 
@@ -544,24 +661,161 @@ function statesToRenderedColors(states: Uint8Array, profileId: FieldProfileId, p
   return Array.from(states, (state, index) => renderedFieldColor(profileId, state, index, phase));
 }
 
-function createInterleavedLayout(): readonly FieldCell[] {
-  const cells: FieldCell[] = [];
-  for (let row = 0; row < FIELD_ROWS; row += 1) {
-    for (let column = 0; column < FIELD_COLUMNS; column += 1) cells.push({ index: row * FIELD_COLUMNS + column, row, column });
+function createFieldGeometries(): Readonly<Record<FieldGeometryId, FieldGeometry>> {
+  const squareRows = Array.from({ length: FIELD_ROWS }, () => [] as number[]);
+  const squareDrafts = Array.from({ length: FIELD_CELL_COUNT }, (_, index) => {
+    const row = Math.floor(index / FIELD_COLUMNS);
+    const column = index % FIELD_COLUMNS;
+    squareRows[row].push(index);
+    return { index, row, column, latticeCenter: { x: column + 0.5, y: row + 0.5 } };
+  });
+  const squareCells = finalizeCells(squareDrafts, squareRows, { left: 0, top: 0, width: FIELD_COLUMNS, height: FIELD_ROWS });
+  const squareMinimum = minimumReferenceDistance(squareCells);
+
+  const triangularRows = Array.from({ length: TRI_ROWS }, () => [] as number[]);
+  const triangularDrafts: Array<{ index: number; row: number; column: number; latticeCenter: Point }> = [];
+  for (let row = 0; row < TRI_ROWS; row += 1) {
+    const centers: number[] = [];
+    if ((row & 1) === 0) {
+      for (let column = 0; column < 57; column += 1) centers.push(column + 0.5);
+    } else {
+      for (let column = 1; column <= 56; column += 1) centers.push(column);
+      if (TRI_EXTRA_ODD_ROWS.has(row)) centers.push(((row - 1) / 6) % 2 === 0 ? 0 : 57);
+      centers.sort((left, right) => left - right);
+    }
+    centers.forEach((x, column) => {
+      const index = triangularDrafts.length;
+      triangularRows[row].push(index);
+      triangularDrafts.push({
+        index,
+        row,
+        column,
+        latticeCenter: { x, y: TRI_HEX_RADIUS + (row * TRI_ROW_PITCH) },
+      });
+    });
   }
-  return cells.sort((left, right) => hash32(left.index + 0x51f15e5) - hash32(right.index + 0x51f15e5) || left.index - right.index);
+  if (triangularDrafts.length !== FIELD_CELL_COUNT) throw new Error("triangular field geometry does not contain exactly 2040 cells");
+  const triangularBounds = {
+    left: -0.5,
+    top: 0,
+    width: 58,
+    height: ((TRI_ROWS - 1) * TRI_ROW_PITCH) + (2 * TRI_HEX_RADIUS),
+  } as const;
+  const triangularCells = finalizeCells(triangularDrafts, triangularRows, triangularBounds);
+  const triangularMinimum = minimumReferenceDistance(triangularCells);
+  return Object.freeze({
+    SQ60: freezeGeometry({
+      id: "SQ60",
+      code: 0,
+      lattice: "square",
+      nominalColumns: FIELD_COLUMNS,
+      nominalRows: FIELD_ROWS,
+      cellCount: FIELD_CELL_COUNT,
+      latticeBounds: { left: 0, top: 0, width: FIELD_COLUMNS, height: FIELD_ROWS },
+      cells: squareCells,
+      rows: squareRows,
+      minimumCenterDistanceAtReference: squareMinimum,
+      minimumDistanceGainOverSquare: 1,
+    }),
+    TRI57: freezeGeometry({
+      id: "TRI57",
+      code: 1,
+      lattice: "affine-triangular",
+      nominalColumns: 57,
+      nominalRows: TRI_ROWS,
+      cellCount: FIELD_CELL_COUNT,
+      latticeBounds: triangularBounds,
+      cells: triangularCells,
+      rows: triangularRows,
+      minimumCenterDistanceAtReference: triangularMinimum,
+      minimumDistanceGainOverSquare: triangularMinimum / squareMinimum,
+    }),
+  });
 }
 
-function scoreFieldStates(states: Uint8Array, profileId: FieldProfileId, previous: readonly number[] | null): number {
-  const palette = FIELD_PROFILES[profileId].palette;
-  let score = 0;
-  for (let row = 0; row < FIELD_ROWS; row += 1) {
-    for (let column = 0; column < FIELD_COLUMNS; column += 1) {
-      const index = row * FIELD_COLUMNS + column;
-      if (column + 1 < FIELD_COLUMNS) score += stateDistance(states[index], states[index + 1], palette);
-      if (row + 1 < FIELD_ROWS) score += stateDistance(states[index], states[index + FIELD_COLUMNS], palette);
-      if (previous && index < previous.length) score += 0.24 * stateDistance(states[index], previous[index], palette);
+function freezeGeometry(
+  geometry: Omit<FieldGeometry, "layout">,
+): FieldGeometry {
+  return Object.freeze({
+    ...geometry,
+    rows: Object.freeze(geometry.rows.map((row) => Object.freeze([...row]))),
+    layout: Object.freeze([...geometry.cells].sort((left, right) => (
+      hash32(left.index + 0x51f15e5) - hash32(right.index + 0x51f15e5) || left.index - right.index
+    ))),
+  });
+}
+
+function finalizeCells(
+  drafts: readonly { index: number; row: number; column: number; latticeCenter: Point }[],
+  rows: readonly (readonly number[])[],
+  bounds: Readonly<{ left: number; top: number; width: number; height: number }>,
+): readonly FieldCell[] {
+  return Object.freeze(drafts.map((draft) => {
+    const neighbours: number[] = [];
+    for (let row = Math.max(0, draft.row - 1); row <= Math.min(rows.length - 1, draft.row + 1); row += 1) {
+      for (const candidateIndex of rows[row]) {
+        if (candidateIndex === draft.index) continue;
+        const candidate = drafts[candidateIndex];
+        const distance = Math.hypot(
+          draft.latticeCenter.x - candidate.latticeCenter.x,
+          draft.latticeCenter.y - candidate.latticeCenter.y,
+        );
+        if (distance <= 1.001) neighbours.push(candidateIndex);
+      }
     }
+    return Object.freeze({
+      ...draft,
+      center: Object.freeze({
+        x: (draft.latticeCenter.x - bounds.left) / bounds.width,
+        y: (draft.latticeCenter.y - bounds.top) / bounds.height,
+      }),
+      latticeCenter: Object.freeze({ ...draft.latticeCenter }),
+      neighbours: Object.freeze(neighbours.sort((left, right) => left - right)),
+    });
+  }));
+}
+
+function minimumReferenceDistance(cells: readonly FieldCell[]): number {
+  let minimum = Infinity;
+  for (const cell of cells) {
+    for (const neighbour of cell.neighbours) {
+      if (neighbour <= cell.index) continue;
+      const other = cells[neighbour];
+      minimum = Math.min(minimum, Math.hypot(
+        (cell.center.x - other.center.x) * FIELD_FRAME.width,
+        (cell.center.y - other.center.y) * FIELD_FRAME.height,
+      ));
+    }
+  }
+  if (!Number.isFinite(minimum)) throw new Error("field geometry has no adjacent cells");
+  return minimum;
+}
+
+function nearestRowCandidates(row: readonly number[], cells: readonly FieldCell[], latticeX: number): readonly number[] {
+  let low = 0;
+  let high = row.length;
+  while (low < high) {
+    const middle = (low + high) >>> 1;
+    if (cells[row[middle]].latticeCenter.x < latticeX) low = middle + 1;
+    else high = middle;
+  }
+  return row.slice(Math.max(0, low - 2), Math.min(row.length, low + 2));
+}
+
+function scoreFieldStates(
+  states: Uint8Array,
+  profileId: FieldProfileId,
+  previous: readonly number[] | null,
+  geometryId: FieldGeometryId,
+): number {
+  const palette = FIELD_PROFILES[profileId].palette;
+  const geometry = fieldGeometry(geometryId);
+  let score = 0;
+  for (const cell of geometry.cells) {
+    for (const neighbour of cell.neighbours) {
+      if (neighbour > cell.index) score += stateDistance(states[cell.index], states[neighbour], palette);
+    }
+    if (previous && cell.index < previous.length) score += 0.24 * stateDistance(states[cell.index], previous[cell.index], palette);
   }
   return score;
 }
@@ -593,10 +847,11 @@ function byteReliabilityOrders(
   symbolReliabilities: readonly number[] | undefined,
   codeword: readonly (number | null)[],
   profile: FieldProfile,
+  geometryId: FieldGeometryId,
 ): number[][] {
   if (!symbolReliabilities) return Array.from({ length: profile.stripeCount }, () => []);
   if (symbolReliabilities.length !== FIELD_CELL_COUNT) throw new Error("native reliability vector length is invalid");
-  const interleavedReliabilities = FIELD_LAYOUT.map((cell) => symbolReliabilities[cell.index]);
+  const interleavedReliabilities = fieldGeometry(geometryId).layout.map((cell) => symbolReliabilities[cell.index]);
   const byteReliabilities = Array.from({ length: profile.stripeCount * profile.innerCodewordBytes }, () => Infinity);
   if (profile.id === "C24") {
     for (let group = 0; group < 128; group += 1) {
@@ -675,6 +930,12 @@ function profileFromCode(code: number): FieldProfile {
   const profile = Object.values(FIELD_PROFILES).find((candidate) => candidate.code === code);
   if (!profile) throw new Error("native color profile code is unsupported");
   return profile;
+}
+
+function geometryFromCode(code: number): FieldGeometry {
+  const geometry = Object.values(FIELD_GEOMETRIES).find((candidate) => candidate.code === code);
+  if (!geometry) throw new Error("native field geometry code is unsupported");
+  return geometry;
 }
 
 function validateMask(maskId: number) {

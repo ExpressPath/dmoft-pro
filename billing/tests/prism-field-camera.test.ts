@@ -5,10 +5,12 @@ import {
   FIELD_FRAME,
   FIELD_PROFILES,
   buildNativeLabObject,
+  createFieldRasterOwners,
   prepareNativeFieldFrame,
   type PreparedNativeFieldFrame,
   type Rgb,
   type FieldProfileId,
+  type FieldGeometryId,
   type Point,
 } from "../src/lib/prism-field";
 import {
@@ -30,6 +32,7 @@ describe("distributed-pilot native camera receiver", () => {
 
     expect(acquisition?.mode).toBe("distributed-pilot");
     expect(acquisition?.phase).toBe(PREPARED.frame.phase);
+    expect(acquisition?.geometryId).toBe(PREPARED.frame.geometryId);
     expect(acquisition?.pilotScore).toBeGreaterThan(0.04);
   });
 
@@ -71,7 +74,16 @@ describe("distributed-pilot native camera receiver", () => {
     const image = renderNativeField(prepared);
     const acquisition = locateNativeField(image);
     expect(acquisition?.phase).toBe(prepared.frame.phase);
+    expect(acquisition?.geometryId).toBe(prepared.frame.geometryId);
     expect(decodeNativeFieldImage(image, acquisition!, [profileId]).decoded.frame.sequence).toBe(12);
+  });
+
+  it.each(["TRI57", "SQ60"] as const)("correlates and decodes the %s geometry", (geometryId) => {
+    const prepared = preparedForGeometry(geometryId, 14);
+    const image = renderNativeField(prepared);
+    const acquisition = locateNativeField(image);
+    expect(acquisition?.geometryId).toBe(geometryId);
+    expect(decodeNativeFieldImage(image, acquisition!, ["C16"]).decoded.frame.geometryId).toBe(geometryId);
   });
 
   it("tracks orientation after a ninety-degree camera rotation", () => {
@@ -114,27 +126,45 @@ function preparedForProfile(profileId: FieldProfileId, sequence: number): Prepar
   return prepareNativeFieldFrame(SESSION, object.bytes, sequence, packet, profileId);
 }
 
+function preparedForGeometry(geometryId: FieldGeometryId, sequence: number): PreparedNativeFieldFrame {
+  const profile = FIELD_PROFILES.C16;
+  return prepareNativeFieldFrame(
+    SESSION,
+    OBJECT.bytes,
+    sequence,
+    Uint8Array.from({ length: profile.raptorPacketBytes }, (_, index) => (index * 83 + sequence) & 0xff),
+    "C16",
+    null,
+    geometryId,
+  );
+}
+
 function renderNativeField(
   prepared: PreparedNativeFieldFrame,
   channel: (color: Rgb) => Rgb = (color) => color,
 ): CameraPixelImage {
   const data = new Uint8ClampedArray(FIELD_FRAME.width * FIELD_FRAME.height * 4);
+  const owners = rasterOwners(prepared.frame.geometryId);
   expect(prepared.renderedColors).toHaveLength(FIELD_CELL_COUNT);
-  for (let row = 0; row < FIELD_FRAME.rows; row += 1) {
-    for (let column = 0; column < FIELD_FRAME.columns; column += 1) {
-      const index = row * FIELD_FRAME.columns + column;
-      fillRect(
-        data,
-        FIELD_FRAME.width,
-        column * FIELD_FRAME.cellPitch,
-        row * FIELD_FRAME.cellPitch,
-        FIELD_FRAME.cellPitch,
-        FIELD_FRAME.cellPitch,
-        channel(prepared.renderedColors[index]),
-      );
-    }
+  for (let pixel = 0; pixel < owners.length; pixel += 1) {
+    const color = channel(prepared.renderedColors[owners[pixel]]);
+    const offset = pixel * 4;
+    data[offset] = color[0];
+    data[offset + 1] = color[1];
+    data[offset + 2] = color[2];
+    data[offset + 3] = 255;
   }
   return { data, width: FIELD_FRAME.width, height: FIELD_FRAME.height };
+}
+
+const OWNER_CACHE = new Map<FieldGeometryId, Uint16Array>();
+
+function rasterOwners(geometryId: FieldGeometryId): Uint16Array {
+  const cached = OWNER_CACHE.get(geometryId);
+  if (cached) return cached;
+  const owners = createFieldRasterOwners(geometryId);
+  OWNER_CACHE.set(geometryId, owners);
+  return owners;
 }
 
 function embedCentered(source: CameraPixelImage, width: number, height: number): CameraPixelImage {

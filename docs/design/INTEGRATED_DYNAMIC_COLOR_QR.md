@@ -1,6 +1,6 @@
 # Prism Native Full-Field Dynamic Optical Profile
 
-Status: implemented experimental browser profile (`PRISM-FIELD-NATIVE-R1`)
+Status: implemented experimental browser profile (`PRISM-FIELD-NATIVE-R2`)
 
 This profile is a native optical physical layer. It is not a QR Code, Micro QR
 Code, or a QR-compatible color extension. It uses the complete displayed
@@ -23,7 +23,7 @@ receiver-bound encrypted container and every AEAD chunk before saving data.
 The operating profile is
 
 ```text
-theta = (nx, ny, M, palette, fps, mask, innerRate, outerOverhead,
+theta = (outerRectangle, lattice, cellRegion, nx, ny, M, palette, fps, mask, innerRate, outerOverhead,
          pilotAmplitude, equalizer, acquisitionPolicy)
 ```
 
@@ -52,23 +52,49 @@ C8, C24, or C32 from measured receiver statistics.
 
 ## 2. Full-field geometry
 
+The display rectangle, sample-center lattice, and visible cell region are
+separate choices. The reference canvas is always 960 x 544, contains exactly
+2,040 protected cells, and reserves no finder, timing, quiet-zone, header,
+calibration, or physical-gap cells.
+
+| Geometry | Sample-center lattice | Natural visible region | Nominal rows | Reference minimum center distance |
+| --- | --- | --- | ---: | ---: |
+| `TRI57` (default) | clipped affine-triangular | nearest-center hexagonal Voronoi | 36 | 16.55 px |
+| `SQ60` (fallback) | 60 x 34 rectangular | nearest-center square Voronoi | 34 | 16.00 px |
+
+`TRI57` uses 57 centers on each even row and 56 on each odd row. Six selected
+odd rows contain one additional alternating boundary center, giving exactly
+
 ```text
-logical cells            60 x 34
-total cells              2,040
-reference cell pitch     16 pixels
-reference canvas         960 x 544 pixels
-reserved cells           0
-quiet-zone cells         0
-finder cells             0
-timing/alignment cells   0
-physical guard gaps      0
-payload/codeword share   100%
+18 * 57 + 18 * 56 + 6 = 2,040 cells.
 ```
 
-The 60:34 rectangle follows a landscape display more closely than a square and
-therefore avoids forcing a large unused margin on common screens. Every cell is
-painted edge-to-edge. The renderer does not draw a neutral underlay or a colored
-core.
+Before the affine fit to the display rectangle, adjacent triangular-lattice
+centers are separated by one unit and consecutive rows by `sqrt(3)/2`. The
+natural nearest-center partition is therefore hexagonal. At the 960 x 544
+reference size, the clipped affine fit increases the worst-case adjacent-center
+distance by about 3.4% over `SQ60` while keeping the protected byte envelope
+identical. This is an optical-separation gain, not a fabricated payload gain.
+
+The renderer assigns every output pixel to its nearest actual center. Boundary
+cells are clipped against the display rectangle, so coverage is exactly 100%
+with no inter-cell gaps even where a boundary lattice point is intentionally
+omitted. `SQ60` remains available because small integer raster modules or
+anisotropic camera blur can make a square lattice faster in practice.
+
+Geometry selection uses measured channel results rather than multiplying by a
+theoretical packing factor:
+
+```text
+score(geometry)
+  = meanCellMutualInformationBits
+  * frameAcceptance
+  * processingFPS
+```
+
+Minimum center distance is only a deterministic tie-breaker. Its effect should
+already be present in measured mutual information and acceptance, so counting it
+again would exaggerate the gain.
 
 This eliminates permanent spatial overhead, but moves acquisition burden into
 signal processing. The old C16 experiment used 1,230 protected color cells in a
@@ -121,16 +147,18 @@ The reader does not call `BarcodeDetector`, `jsQR`, or a QR finder scanner.
 3. Otherwise bin evidence in both axes and robustly fit top, bottom, left, and
    right boundary lines.
 4. Intersect the fitted lines to form a coarse quadrilateral.
-5. Evaluate all eight dihedral orientations and bounded scale hypotheses.
+5. Evaluate `TRI57` and `SQ60`, all eight dihedral orientations, and bounded
+   scale hypotheses.
 6. Remove the likely payload component by nearest-palette blind clustering.
 7. Correlate the residual signal against all sixteen geometry/phase PRBS
    sequences.
-8. Shortlist candidates with the broad C16 reference, then re-score the best
-   eight geometries with C8, C16, C24, and C32 palette models.
+8. Shortlist geometry/orientation/phase candidates with the broad C16 reference,
+   then re-score the best eight with C8, C16, C24, and C32 palette models.
 9. Refine each corner by coordinate descent over decreasing sub-cell offsets.
 10. Reject correlation below `0.028` or resolution below `3.2 px/cell`.
 
-For a tracked quadrilateral, only phase correlation is repeated. Geometry is
+For a tracked quadrilateral, only phase correlation is repeated on the selected
+lattice. Geometry is
 reused for no more than two processed frames and 240 ms. A geometry or sampling
 failure invalidates the track.
 
@@ -226,7 +254,7 @@ without changing the packet layer.
 The 32-byte control record contains:
 
 ```text
-magic, version, profile, phase, mask,
+magic, version, profile, geometry, phase, mask,
 session nonce, sequence,
 RaptorQ packet length, object length, object CRC32,
 palette size, stripe count, field columns, field rows
@@ -251,12 +279,12 @@ bounded erasure depths:
 {0, 1, 2, 4, 8, 12, 20, 28, budget}
 ```
 
-Only a candidate whose MDS stripes, embedded mask, phase, profile, dimensions,
-and CRC32 all agree is accepted.
+Only a candidate whose MDS stripes, embedded mask, phase, profile, geometry,
+nominal dimensions, and CRC32 all agree is accepted.
 
 ## 9. Interleaving and reversible masks
 
-The complete codeword is hash-interleaved over the 60 x 34 field. Consecutive
+The complete codeword is hash-interleaved over the selected 2,040-cell geometry. Consecutive
 header, payload, and parity bytes therefore do not form one glare-sensitive
 region.
 
@@ -290,12 +318,14 @@ frame and no stream restart dependency.
 
 Automated tests cover:
 
-- exact full-field packing with zero reserved cells;
+- exact 2,040-cell square and affine-triangular geometries with full-pixel
+  Voronoi coverage and zero reserved cells;
 - C8, C16, C24, and C32 direct blind decode;
 - grouped radix-24 reversibility and local erasure propagation;
 - sixteen reversible masks;
 - MDS erasure recovery and reliability-guided hard-substitution recovery;
 - distributed phase acquisition without finder/timing patterns;
+- dedicated geometry correlation and decoding for both `TRI57` and `SQ60`;
 - display/camera channel gain and offset;
 - wider camera framing, 90-degree rotation, mild blur, and projective warp;
 - real RFC 6330 reconstruction after systematic loss and packet reordering;

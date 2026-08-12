@@ -4,19 +4,21 @@ import { useEffect, useRef, useState } from "react";
 
 import {
   FIELD_CELL_COUNT,
-  FIELD_COLUMNS,
+  DEFAULT_FIELD_GEOMETRY_ID,
   FIELD_FRAME,
+  FIELD_GEOMETRIES,
   FIELD_GEOMETRY_TRACK_MAX_AGE_MS,
   FIELD_GEOMETRY_TRACK_MAX_FRAMES,
   FIELD_PROFILES,
   FIELD_PROFILE_NAME,
-  FIELD_ROWS,
   FIELD_SOURCE_SYMBOL_COUNT,
   FIELD_TARGET_FPS,
   buildNativeLabObject,
+  createFieldRasterOwners,
   crc32,
   parseNativeLabObject,
   prepareNativeFieldFrame,
+  type FieldGeometryId,
   type FieldProfileId,
   type NativeLabObject,
   type PreparedNativeFieldFrame,
@@ -40,6 +42,7 @@ import styles from "./optical-lab.module.css";
 
 type Role = "sender" | "reader";
 type ProfileChoice = "AUTO" | FieldProfileId;
+type GeometryChoice = "AUTO" | FieldGeometryId;
 
 type SenderMetrics = Readonly<{
   sessionHex: string;
@@ -47,6 +50,7 @@ type SenderMetrics = Readonly<{
   maskId: number;
   phase: number;
   profileId: FieldProfileId;
+  geometryId: FieldGeometryId;
   measuredFps: number;
   raptorPackets: number;
 }>;
@@ -61,6 +65,7 @@ type ReaderMetrics = Readonly<{
   lastSequence: number | null;
   sessionHex: string | null;
   profileId: FieldProfileId | null;
+  geometryId: FieldGeometryId | null;
   confidence: number;
   erasures: number;
   correctedByteErasures: number;
@@ -91,6 +96,7 @@ const EMPTY_READER_METRICS: ReaderMetrics = {
   lastSequence: null,
   sessionHex: null,
   profileId: null,
+  geometryId: null,
   confidence: 0,
   erasures: 0,
   correctedByteErasures: 0,
@@ -109,6 +115,7 @@ const INITIAL_DIAGNOSTICS: ReceiverDiagnostics = {
 export function OpticalLab({ initialRole }: { initialRole: Role }) {
   const [role, setRole] = useState<Role>(initialRole);
   const [profileChoice, setProfileChoice] = useState<ProfileChoice>("AUTO");
+  const [geometryChoice, setGeometryChoice] = useState<GeometryChoice>("AUTO");
   const [senderMetrics, setSenderMetrics] = useState<SenderMetrics | null>(null);
   const [senderSelfTest, setSenderSelfTest] = useState("Initializing RFC 6330 codec…");
   const [cameraActive, setCameraActive] = useState(false);
@@ -129,6 +136,7 @@ export function OpticalLab({ initialRole }: { initialRole: Role }) {
   const readerMetricsRef = useRef<ReaderMetrics>(EMPTY_READER_METRICS);
   const geometryTrackRef = useRef<{
     location: NativeFieldLocation;
+    geometryId: FieldGeometryId;
     framesSinceLock: number;
     lockedAt: number;
   } | null>(null);
@@ -145,6 +153,7 @@ export function OpticalLab({ initialRole }: { initialRole: Role }) {
     let previousStates: number[] | null = null;
     let previousRenderTime = performance.now();
     const profileId: FieldProfileId = profileChoice === "AUTO" ? "C16" : profileChoice;
+    const geometryId: FieldGeometryId = geometryChoice === "AUTO" ? DEFAULT_FIELD_GEOMETRY_ID : geometryChoice;
     const profile = FIELD_PROFILES[profileId];
     const sessionNonce = crypto.getRandomValues(new Uint8Array(8));
     const object = buildNativeLabObject(sessionNonce, profileId);
@@ -164,6 +173,7 @@ export function OpticalLab({ initialRole }: { initialRole: Role }) {
               packets[sequence % packets.length],
               profileId,
               previousStates,
+              geometryId,
             );
             renderSenderFrame(canvas, prepared);
             if (cancelled) return;
@@ -186,6 +196,7 @@ export function OpticalLab({ initialRole }: { initialRole: Role }) {
               maskId: prepared.frame.maskId,
               phase: prepared.frame.phase,
               profileId,
+              geometryId,
               measuredFps: 1000 / Math.max(1, now - previousRenderTime),
               raptorPackets: packets.length,
             });
@@ -211,7 +222,7 @@ export function OpticalLab({ initialRole }: { initialRole: Role }) {
       if (senderTimerRef.current) clearTimeout(senderTimerRef.current);
       senderTimerRef.current = null;
     };
-  }, [profileChoice, role]);
+  }, [geometryChoice, profileChoice, role]);
 
   useEffect(() => () => {
     scanningRef.current = false;
@@ -316,7 +327,7 @@ export function OpticalLab({ initialRole }: { initialRole: Role }) {
         && track.framesSinceLock < FIELD_GEOMETRY_TRACK_MAX_FRAMES
         && timestamp - track.lockedAt <= FIELD_GEOMETRY_TRACK_MAX_AGE_MS;
       let acquisition: NativeFieldAcquisition | null = trackFresh
-        ? trackNativeFieldPhase(image, track.location)
+        ? trackNativeFieldPhase(image, track.location, track.geometryId)
         : null;
       const acquisitionMode: ReaderMetrics["acquisitionMode"] = acquisition ? "tracked" : "detected";
       if (!acquisition) acquisition = locateNativeField(image);
@@ -331,6 +342,7 @@ export function OpticalLab({ initialRole }: { initialRole: Role }) {
       }
       geometryTrackRef.current = {
         location: acquisition.location,
+        geometryId: acquisition.geometryId,
         framesSinceLock: acquisitionMode === "tracked" && track ? track.framesSinceLock + 1 : 0,
         lockedAt: acquisitionMode === "tracked" && track ? track.lockedAt : timestamp,
       };
@@ -358,6 +370,7 @@ export function OpticalLab({ initialRole }: { initialRole: Role }) {
         lastSequence: frame.sequence,
         sessionHex: frame.sessionHex,
         profileId: frame.profileId,
+        geometryId: frame.geometryId,
         confidence: cameraFrame.confidence,
         erasures: cameraFrame.erasures,
         correctedByteErasures: cameraFrame.decoded.correctedByteErasures,
@@ -395,6 +408,9 @@ export function OpticalLab({ initialRole }: { initialRole: Role }) {
   }
 
   const activeProfile = FIELD_PROFILES[senderMetrics?.profileId ?? (profileChoice === "AUTO" ? "C16" : profileChoice)];
+  const activeGeometry = FIELD_GEOMETRIES[
+    senderMetrics?.geometryId ?? (geometryChoice === "AUTO" ? DEFAULT_FIELD_GEOMETRY_ID : geometryChoice)
+  ];
   const progress = Math.min(100, (readerMetrics.acceptedPackets / Math.max(1, readerMetrics.requiredPackets)) * 100);
 
   return (
@@ -437,6 +453,14 @@ export function OpticalLab({ initialRole }: { initialRole: Role }) {
               <option value="C32">C32 · 5 bits/cell</option>
             </select>
           </label>
+          <label className={styles.profileControl}>
+            Cell geometry
+            <select value={geometryChoice} onChange={(event) => setGeometryChoice(event.target.value as GeometryChoice)}>
+              <option value="AUTO">AUTO · affine-triangular bootstrap</option>
+              <option value="TRI57">TRI57 · hexagonal Voronoi cells</option>
+              <option value="SQ60">SQ60 · square raster fallback</option>
+            </select>
+          </label>
           <div className={styles.frameShell}>
             <canvas ref={senderCanvasRef} className={styles.senderCanvas} aria-label="Borderless distributed-pilot dynamic multicolor field" />
           </div>
@@ -445,7 +469,9 @@ export function OpticalLab({ initialRole }: { initialRole: Role }) {
             <span>Phase <strong>{senderMetrics?.phase ?? "…"} / 15</strong></span>
             <span>Mask <strong>{senderMetrics?.maskId ?? "…"} / 15</strong></span>
             <span>Rate <strong>{senderMetrics ? senderMetrics.measuredFps.toFixed(1) : "…"} FPS</strong></span>
-            <span>Geometry <strong>{FIELD_COLUMNS}×{FIELD_ROWS}</strong></span>
+            <span>Geometry <strong>{activeGeometry.id} · {activeGeometry.nominalColumns}×{activeGeometry.nominalRows}</strong></span>
+            <span>Cell region <strong>{activeGeometry.lattice === "affine-triangular" ? "hexagonal Voronoi" : "square Voronoi"}</strong></span>
+            <span>Min. separation <strong>{activeGeometry.minimumCenterDistanceAtReference.toFixed(2)} px</strong></span>
             <span>Palette <strong>{activeProfile.palette.length} states · black/white included</strong></span>
             <span>Information <strong>{activeProfile.bitsPerCell.toFixed(3)} bits/cell</strong></span>
             <span>Reserved cells <strong>0</strong></span>
@@ -491,6 +517,7 @@ export function OpticalLab({ initialRole }: { initialRole: Role }) {
               <span>Acquired <strong>{readerMetrics.acquiredFrames} / {readerMetrics.scannedFrames}</strong></span>
               <span>Last frame <strong>{readerMetrics.lastSequence ?? "—"}</strong></span>
               <span>Profile <strong>{readerMetrics.profileId ?? "—"}</strong></span>
+              <span>Cell geometry <strong>{readerMetrics.geometryId ?? "—"}</strong></span>
               <span>Pilot correlation <strong>{readerMetrics.pilotScore.toFixed(3)}</strong></span>
               <span>Blind-color confidence <strong>{readerMetrics.confidence.toFixed(3)}</strong></span>
               <span>Cell erasures <strong>{readerMetrics.erasures}</strong></span>
@@ -531,18 +558,27 @@ function renderSenderFrame(canvas: HTMLCanvasElement, prepared: PreparedNativeFi
   const context = canvas.getContext("2d");
   if (!context) throw new Error("2D canvas is unavailable");
   context.imageSmoothingEnabled = false;
-  for (let row = 0; row < FIELD_ROWS; row += 1) {
-    for (let column = 0; column < FIELD_COLUMNS; column += 1) {
-      const [red, green, blue] = prepared.renderedColors[(row * FIELD_COLUMNS) + column];
-      context.fillStyle = `rgb(${red} ${green} ${blue})`;
-      context.fillRect(
-        column * FIELD_FRAME.cellPitch,
-        row * FIELD_FRAME.cellPitch,
-        FIELD_FRAME.cellPitch,
-        FIELD_FRAME.cellPitch,
-      );
-    }
+  const owners = fieldRasterOwners(prepared.frame.geometryId);
+  const image = context.createImageData(FIELD_FRAME.width, FIELD_FRAME.height);
+  for (let pixel = 0; pixel < owners.length; pixel += 1) {
+    const [red, green, blue] = prepared.renderedColors[owners[pixel]];
+    const offset = pixel * 4;
+    image.data[offset] = red;
+    image.data[offset + 1] = green;
+    image.data[offset + 2] = blue;
+    image.data[offset + 3] = 255;
   }
+  context.putImageData(image, 0, 0);
+}
+
+const RASTER_OWNER_CACHE = new Map<FieldGeometryId, Uint16Array>();
+
+function fieldRasterOwners(geometryId: FieldGeometryId): Uint16Array {
+  const cached = RASTER_OWNER_CACHE.get(geometryId);
+  if (cached) return cached;
+  const owners = createFieldRasterOwners(geometryId);
+  RASTER_OWNER_CACHE.set(geometryId, owners);
+  return owners;
 }
 
 function verifyRenderedFrame(canvas: HTMLCanvasElement, profileId: FieldProfileId) {

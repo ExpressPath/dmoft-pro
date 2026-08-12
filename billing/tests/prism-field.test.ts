@@ -4,6 +4,7 @@ import {
   FIELD_CELL_COUNT,
   FIELD_COLUMNS,
   FIELD_HEADER_BYTES,
+  FIELD_GEOMETRIES,
   FIELD_INNER_CODEWORD_BYTES,
   FIELD_LAYOUT,
   FIELD_PAYLOAD_FRACTION,
@@ -11,6 +12,7 @@ import {
   FIELD_ROWS,
   applyFieldMask,
   buildNativeLabObject,
+  createFieldRasterOwners,
   decodeNativeFieldSymbols,
   decodeBase24Symbols,
   encodeBase24Bytes,
@@ -19,6 +21,7 @@ import {
   removeFieldMask,
   renderedFieldColor,
   selectAdaptiveFieldProfile,
+  selectAdaptiveFieldGeometry,
 } from "../src/lib/prism-field";
 
 const SESSION = new Uint8Array([0x10, 0x21, 0x32, 0x43, 0x54, 0x65, 0x76, 0x87]);
@@ -30,6 +33,28 @@ describe("borderless distributed native field", () => {
     expect(FIELD_PAYLOAD_FRACTION).toBe(1);
     expect(FIELD_LAYOUT).toHaveLength(FIELD_CELL_COUNT);
     expect(new Set(FIELD_LAYOUT.map((cell) => cell.index)).size).toBe(FIELD_CELL_COUNT);
+  });
+
+  it("defines exact square and affine-triangular 2,040-cell geometries", () => {
+    for (const geometry of Object.values(FIELD_GEOMETRIES)) {
+      expect(geometry.cells).toHaveLength(FIELD_CELL_COUNT);
+      expect(geometry.layout).toHaveLength(FIELD_CELL_COUNT);
+      expect(new Set(geometry.cells.map((cell) => `${cell.center.x}:${cell.center.y}`)).size).toBe(FIELD_CELL_COUNT);
+      expect(new Set(geometry.layout.map((cell) => cell.index)).size).toBe(FIELD_CELL_COUNT);
+      expect(geometry.cells.every((cell) => cell.neighbours.length >= 2)).toBe(true);
+    }
+    expect(FIELD_GEOMETRIES.TRI57.minimumCenterDistanceAtReference)
+      .toBeGreaterThan(FIELD_GEOMETRIES.SQ60.minimumCenterDistanceAtReference);
+    expect(FIELD_GEOMETRIES.TRI57.minimumDistanceGainOverSquare).toBeGreaterThan(1.03);
+  });
+
+  it("rasterizes full-area Voronoi ownership without unassigned pixels", () => {
+    for (const geometryId of ["SQ60", "TRI57"] as const) {
+      const owners = createFieldRasterOwners(geometryId, 192, 108);
+      expect(owners).toHaveLength(192 * 108);
+      expect(Math.max(...owners)).toBeLessThan(FIELD_CELL_COUNT);
+      expect(new Set(owners).size).toBeGreaterThan(1_500);
+    }
   });
 
   it.each(["C8", "C16", "C24", "C32"] as const)("fills the complete field in %s", (profileId) => {
@@ -55,6 +80,23 @@ describe("borderless distributed native field", () => {
     expect(decoded.frame.sessionHex).toBe(prepared.frame.sessionHex);
     expect(decoded.frame.sequence).toBe(19);
     expect(decoded.frame.maskId).toBe(prepared.frame.maskId);
+    expect(decoded.frame.raptorPacket).toEqual(raptorPacket);
+  });
+
+  it.each(["SQ60", "TRI57"] as const)("authenticates the %s geometry in distributed control", (geometryId) => {
+    const profile = FIELD_PROFILES.C16;
+    const object = buildNativeLabObject(SESSION, "C16");
+    const raptorPacket = deterministicBytes(profile.raptorPacketBytes, geometryId === "SQ60" ? 17 : 29);
+    const prepared = prepareNativeFieldFrame(SESSION, object.bytes, 22, raptorPacket, "C16", null, geometryId);
+    const decoded = decodeNativeFieldSymbols(
+      Array.from(prepared.states),
+      "C16",
+      prepared.frame.phase,
+      undefined,
+      undefined,
+      geometryId,
+    );
+    expect(decoded.frame.geometryId).toBe(geometryId);
     expect(decoded.frame.raptorPacket).toEqual(raptorPacket);
   });
 
@@ -143,6 +185,17 @@ describe("borderless distributed native field", () => {
       { profileId: "C16", mutualInformationBits: 3.7, frameAcceptance: 0.94, processingFps: 12 },
       { profileId: "C32", mutualInformationBits: 4.1, frameAcceptance: 0.62, processingFps: 9 },
     ])).toBe("C16");
+  });
+
+  it("selects geometry from measured information, acceptance, and processing rate", () => {
+    expect(selectAdaptiveFieldGeometry([
+      { geometryId: "TRI57", meanCellMutualInformationBits: 3.8, frameAcceptance: 0.94, processingFps: 10 },
+      { geometryId: "SQ60", meanCellMutualInformationBits: 3.9, frameAcceptance: 0.98, processingFps: 12 },
+    ])).toBe("SQ60");
+    expect(selectAdaptiveFieldGeometry([
+      { geometryId: "TRI57", meanCellMutualInformationBits: 3.9, frameAcceptance: 0.98, processingFps: 12 },
+      { geometryId: "SQ60", meanCellMutualInformationBits: 3.9, frameAcceptance: 0.98, processingFps: 12 },
+    ])).toBe("TRI57");
   });
 });
 

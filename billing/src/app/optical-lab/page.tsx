@@ -4,7 +4,7 @@ import { OpticalLab } from "./optical-lab";
 
 export const metadata: Metadata = {
   title: "Prism Native Dynamic Optical Field Lab",
-  description: "A borderless 60 x 34 dynamic multicolor field with distributed acquisition pilots, adaptive 8/16/24/32-state modulation, MDS inner FEC, and RFC 6330 RaptorQ repair.",
+  description: "A borderless 2,040-cell affine-triangular dynamic multicolor field with distributed acquisition pilots, adaptive 8/16/24/32-state modulation, MDS inner FEC, and RFC 6330 RaptorQ repair.",
 };
 
 export default async function OpticalLabPage({

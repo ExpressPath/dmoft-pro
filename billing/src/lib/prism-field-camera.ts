@@ -2,14 +2,17 @@ import { projectPoint, solveHomography } from "./optical-lab";
 import type { CameraPixelImage } from "./optical-camera";
 import {
   FIELD_CELL_COUNT,
-  FIELD_COLUMNS,
+  DEFAULT_FIELD_GEOMETRY_ID,
   FIELD_ERASURE_THRESHOLD,
+  FIELD_FRAME,
+  FIELD_GEOMETRIES,
   FIELD_PHASE_COUNT,
   FIELD_PROFILES,
-  FIELD_ROWS,
   decodeNativeFieldSymbols,
   distributedPilotSign,
+  fieldGeometry,
   renderedFieldColor,
+  type FieldGeometryId,
   type FieldProfileId,
   type NativeFieldDecode,
   type Point,
@@ -25,6 +28,7 @@ export type NativeFieldLocation = Readonly<{
 
 export type NativeFieldAcquisition = Readonly<{
   location: NativeFieldLocation;
+  geometryId: FieldGeometryId;
   phase: number;
   mode: "distributed-pilot";
   pilotScore: number;
@@ -54,6 +58,7 @@ export class NativeFieldDecodeError extends Error {
 
 type OrientationCandidate = Readonly<{
   points: readonly Point[];
+  geometryId: FieldGeometryId;
   phase: number;
   score: number;
   referenceProfileId: FieldProfileId;
@@ -71,11 +76,11 @@ type ClassifiedField = Readonly<{
   erasures: number;
 }>;
 
-const LOGICAL_CORNERS: readonly Point[] = [
+const UNIT_CORNERS: readonly Point[] = [
   { x: 0, y: 0 },
-  { x: FIELD_COLUMNS, y: 0 },
-  { x: FIELD_COLUMNS, y: FIELD_ROWS },
-  { x: 0, y: FIELD_ROWS },
+  { x: 1, y: 0 },
+  { x: 1, y: 1 },
+  { x: 0, y: 1 },
 ];
 const MIN_CELL_PIXELS = 3.2;
 const MIN_PILOT_SCORE = 0.028;
@@ -96,29 +101,31 @@ export function locateNativeField(image: CameraPixelImage): NativeFieldAcquisiti
   const location = pointsToLocation(refined.points);
   return {
     location,
+    geometryId: refined.geometryId,
     phase: refined.phase,
     mode: "distributed-pilot",
     pilotScore: refined.score,
-    observedCellPixels: observedCellPixels(refined.points),
+    observedCellPixels: observedCellPixels(refined.points, refined.geometryId),
   };
 }
 
 export function trackNativeFieldPhase(
   image: CameraPixelImage,
   location: NativeFieldLocation,
+  geometryId: FieldGeometryId = DEFAULT_FIELD_GEOMETRY_ID,
 ): NativeFieldAcquisition | null {
   validateImage(image);
   const points = locationPoints(location);
   let homography: readonly number[];
   try {
-    homography = solveHomography(LOGICAL_CORNERS, points);
+    homography = solveHomography(UNIT_CORNERS, points);
   } catch {
     return null;
   }
   const samples: Rgb[] = [];
   const indices: number[] = [];
   for (let index = 0; index < FIELD_CELL_COUNT; index += PILOT_SAMPLE_STRIDE) {
-    const sample = sampleRgbOrNull(image, projectPoint(homography, logicalCenter(index)));
+    const sample = sampleRgbOrNull(image, projectPoint(homography, logicalCenter(index, geometryId)));
     if (!sample) continue;
     samples.push(sample);
     indices.push(index);
@@ -138,22 +145,23 @@ export function trackNativeFieldPhase(
   if (pilotScore < MIN_PILOT_SCORE) return null;
   return {
     location,
+    geometryId,
     phase,
     mode: "distributed-pilot",
     pilotScore,
-    observedCellPixels: observedCellPixels(points),
+    observedCellPixels: observedCellPixels(points, geometryId),
   };
 }
 
 export function decodeNativeFieldImage(
   image: CameraPixelImage,
-  acquisition: Pick<NativeFieldAcquisition, "location" | "phase">,
+  acquisition: Pick<NativeFieldAcquisition, "location" | "phase" | "geometryId">,
   preferredProfiles: readonly FieldProfileId[] = ["C16", "C8", "C24", "C32"],
   erasureThreshold = FIELD_ERASURE_THRESHOLD,
 ): NativeFieldCameraDecode {
   validateImage(image);
   const initialPoints = locationPoints(acquisition.location);
-  const cellPixels = observedCellPixels(initialPoints);
+  const cellPixels = observedCellPixels(initialPoints, acquisition.geometryId);
   if (cellPixels < MIN_CELL_PIXELS) {
     throw new NativeFieldDecodeError(
       "geometry",
@@ -174,7 +182,7 @@ export function decodeNativeFieldImage(
   for (const points of geometryHypotheses) {
     let homography: readonly number[];
     try {
-      homography = solveHomography(LOGICAL_CORNERS, points);
+      homography = solveHomography(UNIT_CORNERS, points);
     } catch (error) {
       lastError = error;
       continue;
@@ -183,16 +191,16 @@ export function decodeNativeFieldImage(
     try {
       samples = Array.from({ length: FIELD_CELL_COUNT }, (_, index) => sampleRgb(
         image,
-        projectPoint(homography, logicalCenter(index)),
+        projectPoint(homography, logicalCenter(index, acquisition.geometryId)),
         0,
       ));
     } catch (error) {
       lastError = error;
       continue;
     }
-    const hypothesisCellPixels = observedCellPixels(points);
+    const hypothesisCellPixels = observedCellPixels(points, acquisition.geometryId);
     const equalizerStrength = hypothesisCellPixels < 6 ? 0.12 : hypothesisCellPixels < 9 ? 0.06 : 0;
-    if (equalizerStrength > 0) samples = equalizeTouchingCellSamples(samples, equalizerStrength);
+    if (equalizerStrength > 0) samples = equalizeTouchingCellSamples(samples, equalizerStrength, acquisition.geometryId);
     for (const profileId of uniqueProfiles(preferredProfiles)) {
       try {
         const model = estimateBlindAffineModel(samples, profileId, acquisition.phase);
@@ -205,6 +213,7 @@ export function decodeNativeFieldImage(
           acquisition.phase,
           undefined,
           classified.reliabilities,
+          acquisition.geometryId,
         );
         return {
           decoded,
@@ -226,17 +235,15 @@ export function decodeNativeFieldImage(
 }
 
 /** First-order inverse for nearest-neighbour optical leakage. */
-export function equalizeTouchingCellSamples(samples: readonly Rgb[], strength: number): Rgb[] {
+export function equalizeTouchingCellSamples(
+  samples: readonly Rgb[],
+  strength: number,
+  geometryId: FieldGeometryId = DEFAULT_FIELD_GEOMETRY_ID,
+): Rgb[] {
   if (samples.length !== FIELD_CELL_COUNT) throw new Error("equalizer requires a complete field");
   if (!Number.isFinite(strength) || strength < 0 || strength > 0.35) throw new Error("equalizer strength is invalid");
   return samples.map((sample, index) => {
-    const row = Math.floor(index / FIELD_COLUMNS);
-    const column = index % FIELD_COLUMNS;
-    const neighbours: Rgb[] = [];
-    if (row > 0) neighbours.push(samples[index - FIELD_COLUMNS]);
-    if (row + 1 < FIELD_ROWS) neighbours.push(samples[index + FIELD_COLUMNS]);
-    if (column > 0) neighbours.push(samples[index - 1]);
-    if (column + 1 < FIELD_COLUMNS) neighbours.push(samples[index + 1]);
+    const neighbours = fieldGeometry(geometryId).cells[index].neighbours.map((neighbour) => samples[neighbour]);
     const mean = neighbours.reduce<[number, number, number]>((sum, value) => [
       sum[0] + value[0], sum[1] + value[1], sum[2] + value[2],
     ], [0, 0, 0]).map((value) => value / neighbours.length) as [number, number, number];
@@ -253,43 +260,51 @@ function orientByDistributedPilot(image: CameraPixelImage, coarse: readonly Poin
     ));
     const scaledVariants = (touchesEdge ? [1] : [0.97, 1, 1.03, 1.06]).map((scale) => scaleQuad(points, scale));
     for (const scaled of scaledVariants) {
-      let homography: readonly number[];
-      try {
-        homography = solveHomography(LOGICAL_CORNERS, scaled);
-      } catch {
-        continue;
+      for (const geometryId of Object.keys(FIELD_GEOMETRIES) as FieldGeometryId[]) {
+        let homography: readonly number[];
+        try {
+          homography = solveHomography(UNIT_CORNERS, scaled);
+        } catch {
+          continue;
+        }
+        const samples: Rgb[] = [];
+        const indices: number[] = [];
+        for (let index = 0; index < FIELD_CELL_COUNT; index += PILOT_SAMPLE_STRIDE) {
+          const point = projectPoint(homography, logicalCenter(index, geometryId));
+          const sample = sampleRgbOrNull(image, point);
+          if (!sample) continue;
+          samples.push(sample);
+          indices.push(index);
+        }
+        if (samples.length < FIELD_CELL_COUNT / 5) continue;
+        const residuals = payloadRemovedResiduals(samples, "C16");
+        let candidate: OrientationCandidate = {
+          points: scaled,
+          geometryId,
+          phase: 0,
+          score: -Infinity,
+          referenceProfileId: "C16",
+        };
+        for (let phase = 0; phase < FIELD_PHASE_COUNT; phase += 1) {
+          const score = normalizedPilotCorrelation(residuals, indices, phase);
+          if (score > candidate.score) candidate = { ...candidate, phase, score };
+        }
+        coarseCandidates.push(candidate);
       }
-      const samples: Rgb[] = [];
-      const indices: number[] = [];
-      for (let index = 0; index < FIELD_CELL_COUNT; index += PILOT_SAMPLE_STRIDE) {
-        const point = projectPoint(homography, logicalCenter(index));
-        const sample = sampleRgbOrNull(image, point);
-        if (!sample) continue;
-        samples.push(sample);
-        indices.push(index);
-      }
-      if (samples.length < FIELD_CELL_COUNT / 5) continue;
-      const residuals = payloadRemovedResiduals(samples, "C16");
-      let candidate: OrientationCandidate = { points: scaled, phase: 0, score: -Infinity, referenceProfileId: "C16" };
-      for (let phase = 0; phase < FIELD_PHASE_COUNT; phase += 1) {
-        const score = normalizedPilotCorrelation(residuals, indices, phase);
-        if (score > candidate.score) candidate = { points: scaled, phase, score, referenceProfileId: "C16" };
-      }
-      coarseCandidates.push(candidate);
     }
   }
   let best: OrientationCandidate | null = null;
   for (const coarseCandidate of coarseCandidates.sort((left, right) => right.score - left.score).slice(0, 8)) {
     let homography: readonly number[];
     try {
-      homography = solveHomography(LOGICAL_CORNERS, coarseCandidate.points);
+      homography = solveHomography(UNIT_CORNERS, coarseCandidate.points);
     } catch {
       continue;
     }
     const samples: Rgb[] = [];
     const indices: number[] = [];
     for (let index = 0; index < FIELD_CELL_COUNT; index += PILOT_SAMPLE_STRIDE) {
-      const sample = sampleRgbOrNull(image, projectPoint(homography, logicalCenter(index)));
+      const sample = sampleRgbOrNull(image, projectPoint(homography, logicalCenter(index, coarseCandidate.geometryId)));
       if (!sample) continue;
       samples.push(sample);
       indices.push(index);
@@ -298,7 +313,13 @@ function orientByDistributedPilot(image: CameraPixelImage, coarse: readonly Poin
       const residuals = payloadRemovedResiduals(samples, profileId);
       for (let phase = 0; phase < FIELD_PHASE_COUNT; phase += 1) {
         const score = normalizedPilotCorrelation(residuals, indices, phase);
-        if (!best || score > best.score) best = { points: coarseCandidate.points, phase, score, referenceProfileId: profileId };
+        if (!best || score > best.score) best = {
+          points: coarseCandidate.points,
+          geometryId: coarseCandidate.geometryId,
+          phase,
+          score,
+          referenceProfileId: profileId,
+        };
       }
     }
   }
@@ -306,8 +327,11 @@ function orientByDistributedPilot(image: CameraPixelImage, coarse: readonly Poin
 }
 
 function refineDistributedGeometry(image: CameraPixelImage, candidate: OrientationCandidate): OrientationCandidate {
+  if (candidate.points.some((point) => (
+    point.x < 1 || point.y < 1 || point.x > image.width - 2 || point.y > image.height - 2
+  ))) return candidate;
   let best = candidate;
-  const pitch = observedCellPixels(candidate.points);
+  const pitch = observedCellPixels(candidate.points, candidate.geometryId);
   const deltas = [0.72, 0.36, 0.16].map((ratio) => Math.max(0.6, Math.min(11, pitch * ratio)));
   for (const delta of deltas) {
     for (let corner = 0; corner < 4; corner += 1) {
@@ -318,14 +342,14 @@ function refineDistributedGeometry(image: CameraPixelImage, candidate: Orientati
         } : point);
         let homography: readonly number[];
         try {
-          homography = solveHomography(LOGICAL_CORNERS, points);
+          homography = solveHomography(UNIT_CORNERS, points);
         } catch {
           continue;
         }
         const samples: Rgb[] = [];
         const indices: number[] = [];
         for (let index = 0; index < FIELD_CELL_COUNT; index += PILOT_SAMPLE_STRIDE) {
-          const sample = sampleRgbOrNull(image, projectPoint(homography, logicalCenter(index)));
+          const sample = sampleRgbOrNull(image, projectPoint(homography, logicalCenter(index, best.geometryId)));
           if (!sample) continue;
           samples.push(sample);
           indices.push(index);
@@ -380,7 +404,7 @@ function normalizedPilotCorrelation(residuals: readonly number[], indices: reado
 
 function coarseFieldQuad(image: CameraPixelImage): readonly Point[] | null {
   const imageAspect = image.width / image.height;
-  const fieldAspect = FIELD_COLUMNS / FIELD_ROWS;
+  const fieldAspect = FIELD_FRAME.width / FIELD_FRAME.height;
   if (Math.abs(Math.log(imageAspect / fieldAspect)) < 0.07 && textureCoverage(image) > 0.38) {
     return outerImageCorners(image);
   }
@@ -410,7 +434,7 @@ function coarseFieldQuad(image: CameraPixelImage): readonly Point[] | null {
   const bottomRight = minimumBy(bounded, (point) => normalizedCornerCost(point, minimumX, maximumX, minimumY, maximumY, 2));
   const bottomLeft = minimumBy(bounded, (point) => normalizedCornerCost(point, minimumX, maximumX, minimumY, maximumY, 3));
   if (!topLeft || !topRight || !bottomRight || !bottomLeft) return null;
-  return scaleQuad([topLeft, topRight, bottomRight, bottomLeft], 1 + (0.7 / Math.max(1, Math.min(FIELD_COLUMNS, FIELD_ROWS))));
+  return scaleQuad([topLeft, topRight, bottomRight, bottomLeft], 1.02);
 }
 
 function fitEvidenceQuad(
@@ -624,10 +648,23 @@ function uniqueProfiles(input: readonly FieldProfileId[]): FieldProfileId[] {
   return profiles;
 }
 
-function observedCellPixels(points: readonly Point[]): number {
-  const horizontal = (distance(points[0], points[1]) + distance(points[3], points[2])) / (2 * FIELD_COLUMNS);
-  const vertical = (distance(points[0], points[3]) + distance(points[1], points[2])) / (2 * FIELD_ROWS);
-  return Math.min(horizontal, vertical);
+function observedCellPixels(points: readonly Point[], geometryId: FieldGeometryId): number {
+  let homography: readonly number[];
+  try {
+    homography = solveHomography(UNIT_CORNERS, points);
+  } catch {
+    return 0;
+  }
+  const geometry = fieldGeometry(geometryId);
+  let minimum = Infinity;
+  for (let index = 0; index < FIELD_CELL_COUNT; index += 97) {
+    const cell = geometry.cells[index];
+    const center = projectPoint(homography, cell.center);
+    for (const neighbour of cell.neighbours.slice(0, 3)) {
+      minimum = Math.min(minimum, distance(center, projectPoint(homography, geometry.cells[neighbour].center)));
+    }
+  }
+  return Number.isFinite(minimum) ? minimum : 0;
 }
 
 function dihedralPermutations(points: readonly Point[]): Point[][] {
@@ -672,8 +709,8 @@ function locationPoints(location: NativeFieldLocation): readonly Point[] {
   return [location.topLeftCorner, location.topRightCorner, location.bottomRightCorner, location.bottomLeftCorner];
 }
 
-function logicalCenter(index: number): Point {
-  return { x: (index % FIELD_COLUMNS) + 0.5, y: Math.floor(index / FIELD_COLUMNS) + 0.5 };
+function logicalCenter(index: number, geometryId: FieldGeometryId): Point {
+  return fieldGeometry(geometryId).cells[index].center;
 }
 
 function normalizedCornerCost(
