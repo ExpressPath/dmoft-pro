@@ -5,12 +5,9 @@ export const FIELD_ROWS = 34;
 export const FIELD_CELL_COUNT = FIELD_COLUMNS * FIELD_ROWS;
 export const FIELD_FRAME = {
   width: 960,
-  height: 544,
-  cellPitch: 16,
-  columns: FIELD_COLUMNS,
-  rows: FIELD_ROWS,
+  height: 624,
 } as const;
-export const FIELD_PROFILE_NAME = "PRISM-FIELD-NATIVE-R2";
+export const FIELD_PROFILE_NAME = "PRISM-FIELD-NATIVE-R3";
 export const FIELD_PHASE_COUNT = 16;
 export const FIELD_MASK_COUNT = 16;
 export const FIELD_INNER_DATA_BYTES = 213;
@@ -19,19 +16,22 @@ export const FIELD_INNER_CODEWORD_BYTES = 255;
 export const FIELD_HEADER_BYTES = 32;
 export const FIELD_CRC_BYTES = 4;
 export const FIELD_SOURCE_SYMBOL_COUNT = 8;
-export const FIELD_TARGET_FPS = 10;
+export const FIELD_TARGET_FPS = 6;
 export const FIELD_ERASURE_THRESHOLD = 2;
 export const FIELD_GEOMETRY_TRACK_MAX_FRAMES = 2;
 export const FIELD_GEOMETRY_TRACK_MAX_AGE_MS = 240;
 const TRI_ROW_PITCH = Math.sqrt(3) / 2;
 const TRI_HEX_RADIUS = 1 / Math.sqrt(3);
-const TRI_ROWS = 36;
-const TRI_EXTRA_ODD_ROWS = new Set([1, 7, 13, 19, 25, 31]);
+const TRI57_ROWS = 36;
+const TRI57_EXTRA_ODD_ROWS = new Set([1, 7, 13, 19, 25, 31]);
+const TRI49_ROWS = 42;
+const TRI49_EXTRA_ODD_ROWS = new Set([7, 21, 35]);
 
 export type Point = Readonly<{ x: number; y: number }>;
 export type Rgb = Readonly<[number, number, number]>;
 export type FieldProfileId = "C8" | "C16" | "C24" | "C32";
-export type FieldGeometryId = "SQ60" | "TRI57";
+export type FieldGeometryId = "SQ60" | "TRI57" | "TRI49";
+export type FieldOuterShape = "rectangle" | "ellipse" | "regular-hexagon" | "diamond";
 export type FieldCell = Readonly<{
   index: number;
   row: number;
@@ -141,15 +141,23 @@ export const FIELD_PROFILES: Readonly<Record<FieldProfileId, FieldProfile>> = Ob
 });
 
 export const FIELD_GEOMETRIES: Readonly<Record<FieldGeometryId, FieldGeometry>> = createFieldGeometries();
-export const DEFAULT_FIELD_GEOMETRY_ID: FieldGeometryId = "TRI57";
+export const DEFAULT_FIELD_GEOMETRY_ID: FieldGeometryId = "TRI49";
 export const FIELD_LAYOUT: readonly FieldCell[] = FIELD_GEOMETRIES[DEFAULT_FIELD_GEOMETRY_ID].layout;
+export const FIELD_OUTER_SHAPE: FieldOuterShape = "rectangle";
+export const FIELD_OUTER_ASPECT = FIELD_FRAME.width / FIELD_FRAME.height;
+export const FIELD_OUTER_SHAPE_FILL: Readonly<Record<FieldOuterShape, number>> = Object.freeze({
+  rectangle: 1,
+  ellipse: Math.PI / 4,
+  "regular-hexagon": 3 / 4,
+  diamond: 1 / 2,
+});
 export const FIELD_PROTECTED_DENSITY_GAIN_OVER_C16 = (45 * 45) / 1_230;
 export const FIELD_PAYLOAD_FRACTION = 1;
 
 const FRAME_MAGIC = new Uint8Array([0x50, 0x46, 0x4c, 0x44]);
 const OBJECT_MAGIC = new Uint8Array([0x50, 0x46, 0x4f, 0x42]);
-const FIELD_VERSION = 2;
-const OBJECT_MESSAGE = new TextEncoder().encode("PRISM-FIELD-NATIVE-R2-OK");
+const FIELD_VERSION = 3;
+const OBJECT_MESSAGE = new TextEncoder().encode("PRISM-FIELD-NATIVE-R3-OK");
 
 export function buildNativeLabObject(sessionNonce: Uint8Array, profileId: FieldProfileId): NativeLabObject {
   assertSessionNonce(sessionNonce);
@@ -377,7 +385,7 @@ export function distributedPilotSign(cellIndex: number, phase: number, channel: 
 }
 
 export function selectAdaptiveFieldProfile(observations: readonly AdaptiveProfileObservation[]): FieldProfileId {
-  if (observations.length === 0) return "C16";
+  if (observations.length === 0) return "C8";
   let selected = observations[0];
   let selectedScore = -Infinity;
   for (const observation of observations) {
@@ -419,6 +427,21 @@ export function fieldGeometry(id: FieldGeometryId): FieldGeometry {
   const geometry = FIELD_GEOMETRIES[id];
   if (!geometry) throw new Error("native field geometry is unsupported");
   return geometry;
+}
+
+export function fieldAspectUtilization(fieldAspect: number, viewportAspect: number): number {
+  if (!Number.isFinite(fieldAspect) || fieldAspect <= 0 || !Number.isFinite(viewportAspect) || viewportAspect <= 0) {
+    throw new Error("field and viewport aspects must be positive finite numbers");
+  }
+  return Math.min(fieldAspect / viewportAspect, viewportAspect / fieldAspect);
+}
+
+export function balancedFieldAspect(senderViewportAspect: number, receiverViewportAspect: number): number {
+  if (
+    !Number.isFinite(senderViewportAspect) || senderViewportAspect <= 0
+    || !Number.isFinite(receiverViewportAspect) || receiverViewportAspect <= 0
+  ) throw new Error("sender and receiver aspects must be positive finite numbers");
+  return Math.sqrt(senderViewportAspect * receiverViewportAspect);
 }
 
 export function applyFieldMask(
@@ -672,37 +695,8 @@ function createFieldGeometries(): Readonly<Record<FieldGeometryId, FieldGeometry
   const squareCells = finalizeCells(squareDrafts, squareRows, { left: 0, top: 0, width: FIELD_COLUMNS, height: FIELD_ROWS });
   const squareMinimum = minimumReferenceDistance(squareCells);
 
-  const triangularRows = Array.from({ length: TRI_ROWS }, () => [] as number[]);
-  const triangularDrafts: Array<{ index: number; row: number; column: number; latticeCenter: Point }> = [];
-  for (let row = 0; row < TRI_ROWS; row += 1) {
-    const centers: number[] = [];
-    if ((row & 1) === 0) {
-      for (let column = 0; column < 57; column += 1) centers.push(column + 0.5);
-    } else {
-      for (let column = 1; column <= 56; column += 1) centers.push(column);
-      if (TRI_EXTRA_ODD_ROWS.has(row)) centers.push(((row - 1) / 6) % 2 === 0 ? 0 : 57);
-      centers.sort((left, right) => left - right);
-    }
-    centers.forEach((x, column) => {
-      const index = triangularDrafts.length;
-      triangularRows[row].push(index);
-      triangularDrafts.push({
-        index,
-        row,
-        column,
-        latticeCenter: { x, y: TRI_HEX_RADIUS + (row * TRI_ROW_PITCH) },
-      });
-    });
-  }
-  if (triangularDrafts.length !== FIELD_CELL_COUNT) throw new Error("triangular field geometry does not contain exactly 2040 cells");
-  const triangularBounds = {
-    left: -0.5,
-    top: 0,
-    width: 58,
-    height: ((TRI_ROWS - 1) * TRI_ROW_PITCH) + (2 * TRI_HEX_RADIUS),
-  } as const;
-  const triangularCells = finalizeCells(triangularDrafts, triangularRows, triangularBounds);
-  const triangularMinimum = minimumReferenceDistance(triangularCells);
+  const triangular57 = createTriangularGrid(57, TRI57_ROWS, TRI57_EXTRA_ODD_ROWS);
+  const triangular49 = createTriangularGrid(49, TRI49_ROWS, TRI49_EXTRA_ODD_ROWS);
   return Object.freeze({
     SQ60: freezeGeometry({
       id: "SQ60",
@@ -722,15 +716,61 @@ function createFieldGeometries(): Readonly<Record<FieldGeometryId, FieldGeometry
       code: 1,
       lattice: "affine-triangular",
       nominalColumns: 57,
-      nominalRows: TRI_ROWS,
+      nominalRows: TRI57_ROWS,
       cellCount: FIELD_CELL_COUNT,
-      latticeBounds: triangularBounds,
-      cells: triangularCells,
-      rows: triangularRows,
-      minimumCenterDistanceAtReference: triangularMinimum,
-      minimumDistanceGainOverSquare: triangularMinimum / squareMinimum,
+      latticeBounds: triangular57.bounds,
+      cells: triangular57.cells,
+      rows: triangular57.rows,
+      minimumCenterDistanceAtReference: triangular57.minimum,
+      minimumDistanceGainOverSquare: triangular57.minimum / squareMinimum,
+    }),
+    TRI49: freezeGeometry({
+      id: "TRI49",
+      code: 2,
+      lattice: "affine-triangular",
+      nominalColumns: 49,
+      nominalRows: TRI49_ROWS,
+      cellCount: FIELD_CELL_COUNT,
+      latticeBounds: triangular49.bounds,
+      cells: triangular49.cells,
+      rows: triangular49.rows,
+      minimumCenterDistanceAtReference: triangular49.minimum,
+      minimumDistanceGainOverSquare: triangular49.minimum / squareMinimum,
     }),
   });
+}
+
+function createTriangularGrid(evenColumnCount: number, rowCount: number, extraOddRows: ReadonlySet<number>) {
+  const rows = Array.from({ length: rowCount }, () => [] as number[]);
+  const drafts: Array<{ index: number; row: number; column: number; latticeCenter: Point }> = [];
+  let extraNumber = 0;
+  for (let row = 0; row < rowCount; row += 1) {
+    const centers: number[] = [];
+    if ((row & 1) === 0) {
+      for (let column = 0; column < evenColumnCount; column += 1) centers.push(column + 0.5);
+    } else {
+      for (let column = 1; column < evenColumnCount; column += 1) centers.push(column);
+      if (extraOddRows.has(row)) {
+        centers.push((extraNumber & 1) === 0 ? 0 : evenColumnCount);
+        extraNumber += 1;
+      }
+      centers.sort((left, right) => left - right);
+    }
+    centers.forEach((x, column) => {
+      const index = drafts.length;
+      rows[row].push(index);
+      drafts.push({ index, row, column, latticeCenter: { x, y: TRI_HEX_RADIUS + (row * TRI_ROW_PITCH) } });
+    });
+  }
+  if (drafts.length !== FIELD_CELL_COUNT) throw new Error("triangular field geometry does not contain exactly 2040 cells");
+  const bounds = {
+    left: -0.5,
+    top: 0,
+    width: evenColumnCount + 1,
+    height: ((rowCount - 1) * TRI_ROW_PITCH) + (2 * TRI_HEX_RADIUS),
+  } as const;
+  const cells = finalizeCells(drafts, rows, bounds);
+  return { rows, bounds, cells, minimum: minimumReferenceDistance(cells) } as const;
 }
 
 function freezeGeometry(

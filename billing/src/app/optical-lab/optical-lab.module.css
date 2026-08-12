@@ -194,7 +194,7 @@
   left: 50%;
   width: min(88%, 780px);
   height: auto;
-  aspect-ratio: 60 / 34;
+  aspect-ratio: 20 / 13;
   border: 2px solid rgba(112, 240, 189, 0.82);
   border-radius: 12px;
   box-shadow: 0 0 0 999px rgba(0, 0, 0, 0.16);

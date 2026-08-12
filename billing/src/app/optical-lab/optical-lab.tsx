@@ -9,6 +9,9 @@ import {
   FIELD_GEOMETRIES,
   FIELD_GEOMETRY_TRACK_MAX_AGE_MS,
   FIELD_GEOMETRY_TRACK_MAX_FRAMES,
+  FIELD_OUTER_ASPECT,
+  FIELD_OUTER_SHAPE,
+  FIELD_OUTER_SHAPE_FILL,
   FIELD_PROFILES,
   FIELD_PROFILE_NAME,
   FIELD_SOURCE_SYMBOL_COUNT,
@@ -152,7 +155,7 @@ export function OpticalLab({ initialRole }: { initialRole: Role }) {
     let sequence = 0;
     let previousStates: number[] | null = null;
     let previousRenderTime = performance.now();
-    const profileId: FieldProfileId = profileChoice === "AUTO" ? "C16" : profileChoice;
+    const profileId: FieldProfileId = profileChoice === "AUTO" ? "C8" : profileChoice;
     const geometryId: FieldGeometryId = geometryChoice === "AUTO" ? DEFAULT_FIELD_GEOMETRY_ID : geometryChoice;
     const profile = FIELD_PROFILES[profileId];
     const sessionNonce = crypto.getRandomValues(new Uint8Array(8));
@@ -396,9 +399,21 @@ export function OpticalLab({ initialRole }: { initialRole: Role }) {
       }
     } catch (error) {
       const previous = readerMetricsRef.current;
-      updateReaderMetrics({ ...previous, rejectedFrames: previous.rejectedFrames + 1 });
+      const failure = error instanceof NativeFieldDecodeError ? error.diagnostics : null;
+      updateReaderMetrics({
+        ...previous,
+        rejectedFrames: previous.rejectedFrames + 1,
+        profileId: failure?.profileId ?? previous.profileId,
+        geometryId: failure?.geometryId ?? previous.geometryId,
+        confidence: failure?.confidence ?? previous.confidence,
+        erasures: failure?.erasures ?? previous.erasures,
+        observedCellPixels: failure?.observedCellPixels ?? previous.observedCellPixels,
+      });
       const stage = error instanceof NativeFieldDecodeError ? error.stage : "inner-fec";
-      const reason = error instanceof Error ? error.message : "native field decode failed";
+      const baseReason = error instanceof Error ? error.message : "native field decode failed";
+      const reason = failure
+        ? `${baseReason} · ${failure.geometryId}/${failure.profileId}, ${failure.erasures} erasures, confidence ${failure.confidence.toFixed(3)}`
+        : baseReason;
       setDiagnostics({ lastStage: stage, lastReason: reason });
       setReaderStatus(`Frame rejected at ${stage}: ${reason}`);
       if (stage === "geometry" || stage === "sampling") geometryTrackRef.current = null;
@@ -407,7 +422,7 @@ export function OpticalLab({ initialRole }: { initialRole: Role }) {
     }
   }
 
-  const activeProfile = FIELD_PROFILES[senderMetrics?.profileId ?? (profileChoice === "AUTO" ? "C16" : profileChoice)];
+  const activeProfile = FIELD_PROFILES[senderMetrics?.profileId ?? (profileChoice === "AUTO" ? "C8" : profileChoice)];
   const activeGeometry = FIELD_GEOMETRIES[
     senderMetrics?.geometryId ?? (geometryChoice === "AUTO" ? DEFAULT_FIELD_GEOMETRY_ID : geometryChoice)
   ];
@@ -446,7 +461,7 @@ export function OpticalLab({ initialRole }: { initialRole: Role }) {
           <label className={styles.profileControl}>
             Color constellation
             <select value={profileChoice} onChange={(event) => setProfileChoice(event.target.value as ProfileChoice)}>
-              <option value="AUTO">AUTO · robust C16 bootstrap</option>
+              <option value="AUTO">AUTO · robust C8 bootstrap</option>
               <option value="C8">C8 · 3 bits/cell</option>
               <option value="C16">C16 · 4 bits/cell</option>
               <option value="C24">C24 · grouped radix-24</option>
@@ -456,7 +471,8 @@ export function OpticalLab({ initialRole }: { initialRole: Role }) {
           <label className={styles.profileControl}>
             Cell geometry
             <select value={geometryChoice} onChange={(event) => setGeometryChoice(event.target.value as GeometryChoice)}>
-              <option value="AUTO">AUTO · affine-triangular bootstrap</option>
+              <option value="AUTO">AUTO · balanced TRI49 bootstrap</option>
+              <option value="TRI49">TRI49 · balanced hexagonal Voronoi</option>
               <option value="TRI57">TRI57 · hexagonal Voronoi cells</option>
               <option value="SQ60">SQ60 · square raster fallback</option>
             </select>
@@ -470,6 +486,7 @@ export function OpticalLab({ initialRole }: { initialRole: Role }) {
             <span>Mask <strong>{senderMetrics?.maskId ?? "…"} / 15</strong></span>
             <span>Rate <strong>{senderMetrics ? senderMetrics.measuredFps.toFixed(1) : "…"} FPS</strong></span>
             <span>Geometry <strong>{activeGeometry.id} · {activeGeometry.nominalColumns}×{activeGeometry.nominalRows}</strong></span>
+            <span>Outer field <strong>{FIELD_OUTER_SHAPE} · {FIELD_OUTER_ASPECT.toFixed(3)} · {(FIELD_OUTER_SHAPE_FILL[FIELD_OUTER_SHAPE] * 100).toFixed(0)}% fill</strong></span>
             <span>Cell region <strong>{activeGeometry.lattice === "affine-triangular" ? "hexagonal Voronoi" : "square Voronoi"}</strong></span>
             <span>Min. separation <strong>{activeGeometry.minimumCenterDistanceAtReference.toFixed(2)} px</strong></span>
             <span>Palette <strong>{activeProfile.palette.length} states · black/white included</strong></span>
@@ -484,7 +501,7 @@ export function OpticalLab({ initialRole }: { initialRole: Role }) {
           </div>
           <p className={styles.algorithmNote}>
             Control bytes are protected inside the same interleaved MDS codeword as payload bytes. The receiver estimates border geometry and
-            phase by whole-field PRBS correlation, removes payload color by blind clustering, refines an affine camera model from confident decisions,
+            phase by whole-field PRBS correlation, removes payload color by blind clustering, refines a full 3×3 camera color transform from confident decisions,
             and marks ambiguous cells as erasures. C24 uses local 16-cell radix groups so one erasure cannot create object-wide carry propagation.
           </p>
         </section>

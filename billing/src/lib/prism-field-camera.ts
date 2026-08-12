@@ -4,7 +4,6 @@ import {
   FIELD_CELL_COUNT,
   DEFAULT_FIELD_GEOMETRY_ID,
   FIELD_ERASURE_THRESHOLD,
-  FIELD_FRAME,
   FIELD_GEOMETRIES,
   FIELD_PHASE_COUNT,
   FIELD_PROFILES,
@@ -45,11 +44,19 @@ export type NativeFieldCameraDecode = Readonly<{
 }>;
 
 export type NativeFieldDecodeStage = "geometry" | "phase" | "calibration" | "sampling" | "inner-fec";
+export type NativeFieldFailureDiagnostics = Readonly<{
+  geometryId: FieldGeometryId;
+  profileId: FieldProfileId;
+  confidence: number;
+  erasures: number;
+  observedCellPixels: number;
+}>;
 
 export class NativeFieldDecodeError extends Error {
   constructor(
     public readonly stage: NativeFieldDecodeStage,
     message: string,
+    public readonly diagnostics: NativeFieldFailureDiagnostics | null = null,
   ) {
     super(message);
     this.name = "NativeFieldDecodeError";
@@ -65,7 +72,7 @@ type OrientationCandidate = Readonly<{
 }>;
 
 type AffineChannelModel = Readonly<{
-  gains: Rgb;
+  matrix: readonly [Rgb, Rgb, Rgb];
   offsets: Rgb;
 }>;
 
@@ -156,8 +163,35 @@ export function trackNativeFieldPhase(
 export function decodeNativeFieldImage(
   image: CameraPixelImage,
   acquisition: Pick<NativeFieldAcquisition, "location" | "phase" | "geometryId">,
-  preferredProfiles: readonly FieldProfileId[] = ["C16", "C8", "C24", "C32"],
+  preferredProfiles: readonly FieldProfileId[] = ["C8", "C16", "C24", "C32"],
   erasureThreshold = FIELD_ERASURE_THRESHOLD,
+): NativeFieldCameraDecode {
+  const candidates: Array<Pick<NativeFieldAcquisition, "location" | "phase" | "geometryId">> = [acquisition];
+  for (const geometryId of Object.keys(FIELD_GEOMETRIES) as FieldGeometryId[]) {
+    if (geometryId === acquisition.geometryId) continue;
+    const alternate = trackNativeFieldPhase(image, acquisition.location, geometryId);
+    if (alternate) candidates.push(alternate);
+  }
+  let selectedError: NativeFieldDecodeError | null = null;
+  for (const candidate of candidates) {
+    try {
+      return decodeNativeFieldImageCandidate(image, candidate, preferredProfiles, erasureThreshold);
+    } catch (error) {
+      if (!(error instanceof NativeFieldDecodeError)) throw error;
+      if (
+        !selectedError
+        || (error.diagnostics?.erasures ?? Infinity) < (selectedError.diagnostics?.erasures ?? Infinity)
+      ) selectedError = error;
+    }
+  }
+  throw selectedError ?? new NativeFieldDecodeError("inner-fec", "no geometry candidate produced a valid field");
+}
+
+function decodeNativeFieldImageCandidate(
+  image: CameraPixelImage,
+  acquisition: Pick<NativeFieldAcquisition, "location" | "phase" | "geometryId">,
+  preferredProfiles: readonly FieldProfileId[],
+  erasureThreshold: number,
 ): NativeFieldCameraDecode {
   validateImage(image);
   const initialPoints = locationPoints(acquisition.location);
@@ -169,6 +203,7 @@ export function decodeNativeFieldImage(
     );
   }
   let lastError: unknown = null;
+  let bestFailure: NativeFieldFailureDiagnostics | null = null;
   // Borderless segmentation can land a fraction of a cell inside the true
   // outer edge. Try small, bounded sampling lattices and let MDS+CRC select the
   // unique valid geometry instead of trusting a single hard boundary estimate.
@@ -180,6 +215,8 @@ export function decodeNativeFieldImage(
     geometryHypotheses.push(offsetCorner(initialPoints, corner, -cornerDelta));
   }
   for (const points of geometryHypotheses) {
+    const hypothesisCellPixels = observedCellPixels(points, acquisition.geometryId);
+    const sampleRadius = hypothesisCellPixels >= 18 ? 2 : hypothesisCellPixels >= 8 ? 1 : 0;
     let homography: readonly number[];
     try {
       homography = solveHomography(UNIT_CORNERS, points);
@@ -192,13 +229,12 @@ export function decodeNativeFieldImage(
       samples = Array.from({ length: FIELD_CELL_COUNT }, (_, index) => sampleRgb(
         image,
         projectPoint(homography, logicalCenter(index, acquisition.geometryId)),
-        0,
+        sampleRadius,
       ));
     } catch (error) {
       lastError = error;
       continue;
     }
-    const hypothesisCellPixels = observedCellPixels(points, acquisition.geometryId);
     const equalizerStrength = hypothesisCellPixels < 6 ? 0.12 : hypothesisCellPixels < 9 ? 0.06 : 0;
     if (equalizerStrength > 0) samples = equalizeTouchingCellSamples(samples, equalizerStrength, acquisition.geometryId);
     for (const profileId of uniqueProfiles(preferredProfiles)) {
@@ -206,23 +242,39 @@ export function decodeNativeFieldImage(
         const model = estimateBlindAffineModel(samples, profileId, acquisition.phase);
         const first = classifyField(samples, profileId, acquisition.phase, model, erasureThreshold);
         const refinedModel = refineDecisionDirectedModel(samples, first, profileId, acquisition.phase, model);
-        const classified = classifyField(samples, profileId, acquisition.phase, refinedModel, erasureThreshold);
-        const decoded = decodeNativeFieldSymbols(
-          classified.states,
-          profileId,
-          acquisition.phase,
-          undefined,
-          classified.reliabilities,
-          acquisition.geometryId,
-        );
-        return {
-          decoded,
-          confidence: classified.meanConfidence,
-          erasures: classified.erasures,
-          observedCellPixels: hypothesisCellPixels,
-          profileId,
-          equalizerStrength,
-        };
+        for (const candidateModel of [refinedModel, model]) {
+          const classified = candidateModel === model
+            ? first
+            : classifyField(samples, profileId, acquisition.phase, candidateModel, erasureThreshold);
+          const failure = {
+            geometryId: acquisition.geometryId,
+            profileId,
+            confidence: classified.meanConfidence,
+            erasures: classified.erasures,
+            observedCellPixels: hypothesisCellPixels,
+          } as const;
+          if (!bestFailure || failure.erasures < bestFailure.erasures) bestFailure = failure;
+          try {
+            const decoded = decodeNativeFieldSymbols(
+              classified.states,
+              profileId,
+              acquisition.phase,
+              undefined,
+              classified.reliabilities,
+              acquisition.geometryId,
+            );
+            return {
+              decoded,
+              confidence: classified.meanConfidence,
+              erasures: classified.erasures,
+              observedCellPixels: hypothesisCellPixels,
+              profileId,
+              equalizerStrength,
+            };
+          } catch (error) {
+            lastError = error;
+          }
+        }
       } catch (error) {
         lastError = error;
       }
@@ -231,6 +283,7 @@ export function decodeNativeFieldImage(
   throw new NativeFieldDecodeError(
     "inner-fec",
     lastError instanceof Error ? lastError.message : "no adaptive color profile produced a valid field",
+    bestFailure,
   );
 }
 
@@ -294,7 +347,7 @@ function orientByDistributedPilot(image: CameraPixelImage, coarse: readonly Poin
     }
   }
   let best: OrientationCandidate | null = null;
-  for (const coarseCandidate of coarseCandidates.sort((left, right) => right.score - left.score).slice(0, 8)) {
+  for (const coarseCandidate of coarseCandidates.sort((left, right) => right.score - left.score).slice(0, 24)) {
     let homography: readonly number[];
     try {
       homography = solveHomography(UNIT_CORNERS, coarseCandidate.points);
@@ -376,7 +429,7 @@ function payloadRemovedResiduals(samples: readonly Rgb[], profileId: FieldProfil
     let nearest: Rgb | null = null;
     let nearestDistance = Infinity;
     for (const base of FIELD_PROFILES[profileId].palette) {
-      const predicted = base.map((value, channel) => (value * model.gains[channel]) + model.offsets[channel]) as [number, number, number];
+      const predicted = predictColor(model, base);
       const candidateDistance = colorDistance(sample, predicted);
       if (candidateDistance < nearestDistance) {
         nearest = predicted;
@@ -403,11 +456,6 @@ function normalizedPilotCorrelation(residuals: readonly number[], indices: reado
 }
 
 function coarseFieldQuad(image: CameraPixelImage): readonly Point[] | null {
-  const imageAspect = image.width / image.height;
-  const fieldAspect = FIELD_FRAME.width / FIELD_FRAME.height;
-  if (Math.abs(Math.log(imageAspect / fieldAspect)) < 0.07 && textureCoverage(image) > 0.38) {
-    return outerImageCorners(image);
-  }
   const step = Math.max(2, Math.floor(Math.min(image.width, image.height) / 420));
   const evidence: Point[] = [];
   for (let y = step; y < image.height - step; y += step) {
@@ -420,6 +468,7 @@ function coarseFieldQuad(image: CameraPixelImage): readonly Point[] | null {
     }
   }
   if (evidence.length < 120) return null;
+  if (fieldEvidenceTouchesAllImageEdges(evidence, image, step)) return outerImageCorners(image);
   // Keep the true outer cell rows. A one-percent trim is already close to a
   // complete cell at this grid size and biases a borderless estimate inward.
   const minimumX = percentile(evidence.map((point) => point.x), 0.001);
@@ -515,19 +564,17 @@ function intersectYX(
   return { x, y: (horizontal.slope * x) + horizontal.offset };
 }
 
-function textureCoverage(image: CameraPixelImage): number {
-  const step = Math.max(3, Math.floor(Math.min(image.width, image.height) / 180));
-  let textured = 0;
-  let samples = 0;
-  for (let y = step; y < image.height - step; y += step) {
-    for (let x = step; x < image.width - step; x += step) {
-      const pixel = rgbAt(image, x, y);
-      const neighbour = rgbAt(image, x + step, y);
-      if ((Math.max(...pixel) - Math.min(...pixel)) > 25 || colorDistance(pixel, neighbour) > 28) textured += 1;
-      samples += 1;
-    }
-  }
-  return textured / Math.max(1, samples);
+function fieldEvidenceTouchesAllImageEdges(
+  evidence: readonly Point[],
+  image: CameraPixelImage,
+  step: number,
+): boolean {
+  const margin = step * 2.5;
+  const minimumSupport = Math.max(5, Math.floor(Math.min(image.width, image.height) / Math.max(1, step * 90)));
+  return evidence.filter((point) => point.x <= margin).length >= minimumSupport
+    && evidence.filter((point) => point.x >= image.width - 1 - margin).length >= minimumSupport
+    && evidence.filter((point) => point.y <= margin).length >= minimumSupport
+    && evidence.filter((point) => point.y >= image.height - 1 - margin).length >= minimumSupport;
 }
 
 function estimateBlindAffineModel(samples: readonly Rgb[], profileId: FieldProfileId, phase: number): AffineChannelModel {
@@ -547,7 +594,7 @@ function estimateBlindAffineModel(samples: readonly Rgb[], profileId: FieldProfi
     gains.push(clampRange(gain, 0.35, 2.4));
     offsets.push(observedLow - (gains[channel] * nominalLow));
   }
-  return { gains: gains as [number, number, number], offsets: offsets as [number, number, number] };
+  return diagonalAffineModel(gains as [number, number, number], offsets as [number, number, number]);
 }
 
 function estimateBasePaletteAffine(samples: readonly Rgb[], profileId: FieldProfileId): AffineChannelModel {
@@ -563,7 +610,7 @@ function estimateBasePaletteAffine(samples: readonly Rgb[], profileId: FieldProf
     gains.push(gain);
     offsets.push(observedLow - (gain * nominalLow));
   }
-  return { gains: gains as [number, number, number], offsets: offsets as [number, number, number] };
+  return diagonalAffineModel(gains as [number, number, number], offsets as [number, number, number]);
 }
 
 function classifyField(
@@ -581,7 +628,7 @@ function classifyField(
   for (let index = 0; index < samples.length; index += 1) {
     const distances = profile.palette.map((_, state) => {
       const nominal = renderedFieldColor(profileId, state, index, phase);
-      const expected = nominal.map((value, channel) => (value * model.gains[channel]) + model.offsets[channel]) as [number, number, number];
+      const expected = predictColor(model, nominal);
       return colorDistance(samples[index], expected);
     });
     const order = distances.map((distance, state) => ({ distance, state }))
@@ -611,41 +658,85 @@ function refineDecisionDirectedModel(
     .sort((left, right) => right.reliability - left.reliability)
     .slice(0, Math.max(180, Math.floor(FIELD_CELL_COUNT * 0.55)));
   if (accepted.length < 64) return fallback;
-  const gains: number[] = [];
+  const design = accepted.map(({ index }) => {
+    const state = classified.states[index] as number;
+    const nominal = renderedFieldColor(profileId, state, index, phase);
+    return {
+      index,
+      features: [nominal[0] / 255, nominal[1] / 255, nominal[2] / 255, 1] as const,
+    };
+  });
+  const rows: Rgb[] = [];
   const offsets: number[] = [];
   for (let channel = 0; channel < 3; channel += 1) {
-    let sumX = 0;
-    let sumY = 0;
-    let sumXX = 0;
-    let sumXY = 0;
-    for (const { index } of accepted) {
-      const state = classified.states[index] as number;
-      const x = renderedFieldColor(profileId, state, index, phase)[channel];
-      const y = samples[index][channel];
-      sumX += x;
-      sumY += y;
-      sumXX += x * x;
-      sumXY += x * y;
+    const normal = Array.from({ length: 4 }, () => Array.from({ length: 4 }, () => 0));
+    const target = Array.from({ length: 4 }, () => 0);
+    for (const { index, features } of design) {
+      for (let row = 0; row < 4; row += 1) {
+        target[row] += features[row] * samples[index][channel];
+        for (let column = 0; column < 4; column += 1) normal[row][column] += features[row] * features[column];
+      }
     }
-    const count = accepted.length;
-    const denominator = (count * sumXX) - (sumX * sumX);
-    if (Math.abs(denominator) < 1) {
-      gains.push(fallback.gains[channel]);
-      offsets.push(fallback.offsets[channel]);
-      continue;
-    }
-    const gain = clampRange(((count * sumXY) - (sumX * sumY)) / denominator, 0.35, 2.4);
-    gains.push(gain);
-    offsets.push((sumY - (gain * sumX)) / count);
+    for (let diagonal = 0; diagonal < 3; diagonal += 1) normal[diagonal][diagonal] += 0.015;
+    const solved = solveLinearSystem(normal, target);
+    if (!solved || solved.some((value) => !Number.isFinite(value))) return fallback;
+    rows.push([
+      clampRange(solved[0] / 255, -0.8, 2.4),
+      clampRange(solved[1] / 255, -0.8, 2.4),
+      clampRange(solved[2] / 255, -0.8, 2.4),
+    ]);
+    offsets.push(clampRange(solved[3], -128, 192));
   }
-  return { gains: gains as [number, number, number], offsets: offsets as [number, number, number] };
+  return { matrix: rows as [[number, number, number], [number, number, number], [number, number, number]], offsets: offsets as [number, number, number] };
 }
 
 function uniqueProfiles(input: readonly FieldProfileId[]): FieldProfileId[] {
   const profiles = [...new Set(input)];
-  if (profiles.length === 0) return ["C16", "C8", "C24", "C32"];
+  if (profiles.length === 0) return ["C8", "C16", "C24", "C32"];
   for (const profile of profiles) if (!FIELD_PROFILES[profile]) throw new Error("unknown field profile");
   return profiles;
+}
+
+function diagonalAffineModel(gains: Rgb, offsets: Rgb): AffineChannelModel {
+  return {
+    matrix: [
+      [gains[0], 0, 0],
+      [0, gains[1], 0],
+      [0, 0, gains[2]],
+    ],
+    offsets,
+  };
+}
+
+function predictColor(model: AffineChannelModel, nominal: Rgb): Rgb {
+  return model.matrix.map((row, channel) => (
+    (row[0] * nominal[0])
+    + (row[1] * nominal[1])
+    + (row[2] * nominal[2])
+    + model.offsets[channel]
+  )) as [number, number, number];
+}
+
+function solveLinearSystem(matrixInput: readonly (readonly number[])[], vectorInput: readonly number[]): number[] | null {
+  const size = vectorInput.length;
+  if (matrixInput.length !== size || matrixInput.some((row) => row.length !== size)) return null;
+  const augmented = matrixInput.map((row, index) => [...row, vectorInput[index]]);
+  for (let pivot = 0; pivot < size; pivot += 1) {
+    let selected = pivot;
+    for (let row = pivot + 1; row < size; row += 1) {
+      if (Math.abs(augmented[row][pivot]) > Math.abs(augmented[selected][pivot])) selected = row;
+    }
+    if (Math.abs(augmented[selected][pivot]) < 1e-9) return null;
+    [augmented[pivot], augmented[selected]] = [augmented[selected], augmented[pivot]];
+    const divisor = augmented[pivot][pivot];
+    for (let column = pivot; column <= size; column += 1) augmented[pivot][column] /= divisor;
+    for (let row = 0; row < size; row += 1) {
+      if (row === pivot) continue;
+      const factor = augmented[row][pivot];
+      for (let column = pivot; column <= size; column += 1) augmented[row][column] -= factor * augmented[pivot][column];
+    }
+  }
+  return augmented.map((row) => row[size]);
 }
 
 function observedCellPixels(points: readonly Point[], geometryId: FieldGeometryId): number {
@@ -689,15 +780,6 @@ function offsetCorner(points: readonly Point[], corner: number, delta: number): 
   }));
 }
 
-function outerImageCorners(image: CameraPixelImage): readonly Point[] {
-  return [
-    { x: 0, y: 0 },
-    { x: image.width - 1, y: 0 },
-    { x: image.width - 1, y: image.height - 1 },
-    { x: 0, y: image.height - 1 },
-  ];
-}
-
 function pointsToLocation(points: readonly Point[]): NativeFieldLocation {
   return {
     topLeftCorner: points[0], topRightCorner: points[1],
@@ -707,6 +789,15 @@ function pointsToLocation(points: readonly Point[]): NativeFieldLocation {
 
 function locationPoints(location: NativeFieldLocation): readonly Point[] {
   return [location.topLeftCorner, location.topRightCorner, location.bottomRightCorner, location.bottomLeftCorner];
+}
+
+function outerImageCorners(image: CameraPixelImage): readonly Point[] {
+  return [
+    { x: 0, y: 0 },
+    { x: image.width - 1, y: 0 },
+    { x: image.width - 1, y: image.height - 1 },
+    { x: 0, y: image.height - 1 },
+  ];
 }
 
 function logicalCenter(index: number, geometryId: FieldGeometryId): Point {

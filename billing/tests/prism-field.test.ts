@@ -7,16 +7,21 @@ import {
   FIELD_GEOMETRIES,
   FIELD_INNER_CODEWORD_BYTES,
   FIELD_LAYOUT,
+  FIELD_OUTER_ASPECT,
+  FIELD_OUTER_SHAPE,
+  FIELD_OUTER_SHAPE_FILL,
   FIELD_PAYLOAD_FRACTION,
   FIELD_PROFILES,
   FIELD_ROWS,
   applyFieldMask,
+  balancedFieldAspect,
   buildNativeLabObject,
   createFieldRasterOwners,
   decodeNativeFieldSymbols,
   decodeBase24Symbols,
   encodeBase24Bytes,
   encodeBytesToSymbols,
+  fieldAspectUtilization,
   prepareNativeFieldFrame,
   removeFieldMask,
   renderedFieldColor,
@@ -35,6 +40,19 @@ describe("borderless distributed native field", () => {
     expect(new Set(FIELD_LAYOUT.map((cell) => cell.index)).size).toBe(FIELD_CELL_COUNT);
   });
 
+  it("selects the maximum-fill outer shape and a near-optimal balanced aspect", () => {
+    expect(FIELD_OUTER_SHAPE).toBe("rectangle");
+    expect(FIELD_OUTER_SHAPE_FILL.rectangle).toBe(1);
+    expect(FIELD_OUTER_SHAPE_FILL.rectangle).toBeGreaterThan(FIELD_OUTER_SHAPE_FILL.ellipse);
+    expect(FIELD_OUTER_SHAPE_FILL.rectangle).toBeGreaterThan(FIELD_OUTER_SHAPE_FILL["regular-hexagon"]);
+    expect(FIELD_OUTER_ASPECT).toBeCloseTo(20 / 13, 8);
+    const balanced = balancedFieldAspect(16 / 9, 4 / 3);
+    expect(balanced).toBeCloseTo(1.5396, 3);
+    expect(fieldAspectUtilization(balanced, 16 / 9)).toBeCloseTo(fieldAspectUtilization(balanced, 4 / 3), 8);
+    expect(fieldAspectUtilization(FIELD_OUTER_ASPECT, 16 / 9)).toBeGreaterThan(0.86);
+    expect(fieldAspectUtilization(FIELD_OUTER_ASPECT, 4 / 3)).toBeGreaterThan(0.86);
+  });
+
   it("defines exact square and affine-triangular 2,040-cell geometries", () => {
     for (const geometry of Object.values(FIELD_GEOMETRIES)) {
       expect(geometry.cells).toHaveLength(FIELD_CELL_COUNT);
@@ -46,10 +64,13 @@ describe("borderless distributed native field", () => {
     expect(FIELD_GEOMETRIES.TRI57.minimumCenterDistanceAtReference)
       .toBeGreaterThan(FIELD_GEOMETRIES.SQ60.minimumCenterDistanceAtReference);
     expect(FIELD_GEOMETRIES.TRI57.minimumDistanceGainOverSquare).toBeGreaterThan(1.03);
+    expect(FIELD_GEOMETRIES.TRI49.minimumCenterDistanceAtReference)
+      .toBeGreaterThan(FIELD_GEOMETRIES.TRI57.minimumCenterDistanceAtReference);
+    expect(FIELD_GEOMETRIES.TRI49.minimumDistanceGainOverSquare).toBeGreaterThan(1.09);
   });
 
   it("rasterizes full-area Voronoi ownership without unassigned pixels", () => {
-    for (const geometryId of ["SQ60", "TRI57"] as const) {
+    for (const geometryId of ["SQ60", "TRI57", "TRI49"] as const) {
       const owners = createFieldRasterOwners(geometryId, 192, 108);
       expect(owners).toHaveLength(192 * 108);
       expect(Math.max(...owners)).toBeLessThan(FIELD_CELL_COUNT);
@@ -83,7 +104,7 @@ describe("borderless distributed native field", () => {
     expect(decoded.frame.raptorPacket).toEqual(raptorPacket);
   });
 
-  it.each(["SQ60", "TRI57"] as const)("authenticates the %s geometry in distributed control", (geometryId) => {
+  it.each(["SQ60", "TRI57", "TRI49"] as const)("authenticates the %s geometry in distributed control", (geometryId) => {
     const profile = FIELD_PROFILES.C16;
     const object = buildNativeLabObject(SESSION, "C16");
     const raptorPacket = deterministicBytes(profile.raptorPacketBytes, geometryId === "SQ60" ? 17 : 29);
@@ -195,7 +216,8 @@ describe("borderless distributed native field", () => {
     expect(selectAdaptiveFieldGeometry([
       { geometryId: "TRI57", meanCellMutualInformationBits: 3.9, frameAcceptance: 0.98, processingFps: 12 },
       { geometryId: "SQ60", meanCellMutualInformationBits: 3.9, frameAcceptance: 0.98, processingFps: 12 },
-    ])).toBe("TRI57");
+      { geometryId: "TRI49", meanCellMutualInformationBits: 3.9, frameAcceptance: 0.98, processingFps: 12 },
+    ])).toBe("TRI49");
   });
 });
 

@@ -60,6 +60,18 @@ describe("distributed-pilot native camera receiver", () => {
     expect(decoded.profileId).toBe("C16");
   });
 
+  it("recovers after non-integer camera resampling and RGB channel mixing", () => {
+    const mixed = renderNativeField(PREPARED, ([red, green, blue]) => [
+      clamp((0.74 * red) + (0.13 * green) + (0.05 * blue) + 15),
+      clamp((0.08 * red) + (0.76 * green) + (0.10 * blue) + 11),
+      clamp((0.06 * red) + (0.17 * green) + (0.68 * blue) + 19),
+    ]);
+    const image = addCameraArtifacts(boxBlur(resampleBilinear(mixed, 389, 223), 1));
+    const acquisition = locateNativeField(image);
+    expect(acquisition).not.toBeNull();
+    expect(decodeNativeFieldImage(image, acquisition!, ["C16"]).decoded.frame.sequence).toBe(21);
+  });
+
   it("locates the field inside a wider camera image", () => {
     const embedded = embedCentered(renderNativeField(PREPARED), 1_280, 800);
     const acquisition = locateNativeField(embedded);
@@ -78,7 +90,7 @@ describe("distributed-pilot native camera receiver", () => {
     expect(decodeNativeFieldImage(image, acquisition!, [profileId]).decoded.frame.sequence).toBe(12);
   });
 
-  it.each(["TRI57", "SQ60"] as const)("correlates and decodes the %s geometry", (geometryId) => {
+  it.each(["TRI49", "TRI57", "SQ60"] as const)("correlates and decodes the %s geometry", (geometryId) => {
     const prepared = preparedForGeometry(geometryId, 14);
     const image = renderNativeField(prepared);
     const acquisition = locateNativeField(image);
@@ -111,10 +123,12 @@ describe("distributed-pilot native camera receiver", () => {
       renderNativeField(PREPARED),
       corners,
       1_140,
-      760,
+      741,
     );
     const acquisition = locateNativeField(image);
     expect(acquisition).not.toBeNull();
+    expect(acquisition!.location.topLeftCorner.x).toBeGreaterThan(100);
+    expect(acquisition!.location.topLeftCorner.y).toBeGreaterThan(75);
     expect(decodeNativeFieldImage(image, acquisition!, ["C16"]).decoded.frame.sequence).toBe(21);
   });
 });
@@ -240,6 +254,56 @@ function boxBlur(source: CameraPixelImage, radius: number): CameraPixelImage {
       data[destination] = Math.round(totals[0] / count);
       data[destination + 1] = Math.round(totals[1] / count);
       data[destination + 2] = Math.round(totals[2] / count);
+      data[destination + 3] = 255;
+    }
+  }
+  return { data, width: source.width, height: source.height };
+}
+
+function resampleBilinear(source: CameraPixelImage, width: number, height: number): CameraPixelImage {
+  const data = new Uint8ClampedArray(width * height * 4);
+  for (let y = 0; y < height; y += 1) {
+    const sourceY = ((y + 0.5) * source.height / height) - 0.5;
+    const y0 = Math.max(0, Math.min(source.height - 1, Math.floor(sourceY)));
+    const y1 = Math.min(source.height - 1, y0 + 1);
+    const fy = sourceY - Math.floor(sourceY);
+    for (let x = 0; x < width; x += 1) {
+      const sourceX = ((x + 0.5) * source.width / width) - 0.5;
+      const x0 = Math.max(0, Math.min(source.width - 1, Math.floor(sourceX)));
+      const x1 = Math.min(source.width - 1, x0 + 1);
+      const fx = sourceX - Math.floor(sourceX);
+      const destination = ((y * width) + x) * 4;
+      for (let channel = 0; channel < 3; channel += 1) {
+        const top = (source.data[((y0 * source.width) + x0) * 4 + channel] * (1 - fx))
+          + (source.data[((y0 * source.width) + x1) * 4 + channel] * fx);
+        const bottom = (source.data[((y1 * source.width) + x0) * 4 + channel] * (1 - fx))
+          + (source.data[((y1 * source.width) + x1) * 4 + channel] * fx);
+        data[destination + channel] = Math.round((top * (1 - fy)) + (bottom * fy));
+      }
+      data[destination + 3] = 255;
+    }
+  }
+  return { data, width, height };
+}
+
+function addCameraArtifacts(source: CameraPixelImage): CameraPixelImage {
+  const data = new Uint8ClampedArray(source.data.length);
+  let noise = 0x12345678;
+  for (let y = 0; y < source.height; y += 1) {
+    for (let x = 0; x < source.width; x += 1) {
+      const destination = ((y * source.width) + x) * 4;
+      const radialX = ((x + 0.5) / source.width) - 0.5;
+      const radialY = ((y + 0.5) / source.height) - 0.5;
+      const shading = 1 - (0.32 * ((radialX * radialX) + (radialY * radialY)));
+      const sourceXs = [Math.min(source.width - 1, x + 1), x, Math.max(0, x - 1)];
+      for (let channel = 0; channel < 3; channel += 1) {
+        noise ^= noise << 13;
+        noise ^= noise >>> 17;
+        noise ^= noise << 5;
+        const perturbation = ((noise >>> 24) - 128) / 9;
+        const sourceOffset = ((y * source.width) + sourceXs[channel]) * 4;
+        data[destination + channel] = clamp((source.data[sourceOffset + channel] * shading) + perturbation);
+      }
       data[destination + 3] = 255;
     }
   }

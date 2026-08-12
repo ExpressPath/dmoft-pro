@@ -1,6 +1,6 @@
 # Prism Native Full-Field Dynamic Optical Profile
 
-Status: implemented experimental browser profile (`PRISM-FIELD-NATIVE-R2`)
+Status: implemented experimental browser profile (`PRISM-FIELD-NATIVE-R3`)
 
 This profile is a native optical physical layer. It is not a QR Code, Micro QR
 Code, or a QR-compatible color extension. It uses the complete displayed
@@ -23,7 +23,7 @@ receiver-bound encrypted container and every AEAD chunk before saving data.
 The operating profile is
 
 ```text
-theta = (outerRectangle, lattice, cellRegion, nx, ny, M, palette, fps, mask, innerRate, outerOverhead,
+theta = (outerShape, outerAspect, lattice, cellRegion, nx, ny, M, palette, fps, mask, innerRate, outerOverhead,
          pilotAmplitude, equalizer, acquisitionPolicy)
 ```
 
@@ -47,33 +47,68 @@ score(profile)
   * innerCodeRate
 ```
 
-The initial automatic bootstrap is C16. Bidirectional feedback can later select
-C8, C24, or C32 from measured receiver statistics.
+The initial automatic bootstrap is C8 at 6 logical FPS. Bidirectional feedback
+can later select C16, C24, C32, and a faster cadence from measured receiver
+statistics.
 
 ## 2. Full-field geometry
 
-The display rectangle, sample-center lattice, and visible cell region are
-separate choices. The reference canvas is always 960 x 544, contains exactly
+The outer silhouette, display aspect, sample-center lattice, and visible cell
+region are separate choices. The reference canvas is 960 x 624, contains exactly
 2,040 protected cells, and reserves no finder, timing, quiet-zone, header,
 calibration, or physical-gap cells.
 
+For a single field inside a rectangular display/camera bounding box, the
+bounding-box fill fractions are:
+
+```text
+rectangle       1.0000
+ellipse          pi/4 = 0.7854
+regular hexagon  3/4  = 0.7500
+diamond          1/2  = 0.5000
+```
+
+Therefore a rectangle remains the area-optimal outer silhouette. Hexagons are
+used for the internal Voronoi cells, not for the outer boundary. Replacing the
+outer rectangle with a circle or hexagon would discard 21.5% or 25% of the
+available screen before channel errors are considered.
+
+If a field with aspect `a` is fitted into a viewport with aspect `r`, its
+maximum framing utilization is
+
+```text
+U(a,r) = min(a/r, r/a).
+```
+
+For a 16:9 sender and a 4:3 receiver, the aspect that equalizes the two framing
+losses is the geometric mean
+
+```text
+a* = sqrt((16/9)(4/3)) = 1.53960...
+```
+
+The implemented 960:624 ratio is `20/13 = 1.53846`, within 0.08% of that target.
+It retains more than 86% framing utilization at both 16:9 and 4:3, instead of
+optimizing one device while forcing the other down to 75%.
+
 | Geometry | Sample-center lattice | Natural visible region | Nominal rows | Reference minimum center distance |
 | --- | --- | --- | ---: | ---: |
-| `TRI57` (default) | clipped affine-triangular | nearest-center hexagonal Voronoi | 36 | 16.55 px |
+| `TRI49` (default) | clipped affine-triangular | nearest-center hexagonal Voronoi | 42 | 17.6 px |
+| `TRI57` (wide fallback) | clipped affine-triangular | nearest-center hexagonal Voronoi | 36 | 16.55 px |
 | `SQ60` (fallback) | 60 x 34 rectangular | nearest-center square Voronoi | 34 | 16.00 px |
 
-`TRI57` uses 57 centers on each even row and 56 on each odd row. Six selected
+`TRI49` uses 49 centers on each even row and 48 on each odd row. Three selected
 odd rows contain one additional alternating boundary center, giving exactly
 
 ```text
-18 * 57 + 18 * 56 + 6 = 2,040 cells.
+21 * 49 + 21 * 48 + 3 = 2,040 cells.
 ```
 
 Before the affine fit to the display rectangle, adjacent triangular-lattice
 centers are separated by one unit and consecutive rows by `sqrt(3)/2`. The
-natural nearest-center partition is therefore hexagonal. At the 960 x 544
-reference size, the clipped affine fit increases the worst-case adjacent-center
-distance by about 3.4% over `SQ60` while keeping the protected byte envelope
+natural nearest-center partition is therefore hexagonal. At the 960 x 624
+reference size, the balanced `TRI49` fit increases the worst-case adjacent-center
+distance by about 10% over `SQ60` while keeping the protected byte envelope
 identical. This is an optical-separation gain, not a fabricated payload gain.
 
 The renderer assigns every output pixel to its nearest actual center. Boundary
@@ -137,25 +172,33 @@ The pilot is an additive perturbation of every payload color. It never replaces
 the protected payload symbol. Sixteen phase sequences allow a receiver to join
 at any visible frame without waiting for a beacon or animation restart.
 
+The R3 robust bootstrap holds each logical frame for about 167 ms (6 FPS). A
+30 FPS camera can therefore observe several exposures per logical frame, which
+reduces the fraction intersecting a display transition or rolling-shutter seam.
+Higher cadence is an adaptive mode and must be justified by measured accepted
+throughput, not configured merely to raise the displayed FPS number.
+
 ## 4. Borderless acquisition
 
 The reader does not call `BarcodeDetector`, `jsQR`, or a QR finder scanner.
 
 1. Build a coarse field-evidence map from local chroma and color gradients.
-2. If the complete camera image has the expected aspect and texture coverage,
-   use its outer bounds directly.
-3. Otherwise bin evidence in both axes and robustly fit top, bottom, left, and
-   right boundary lines.
-4. Intersect the fitted lines to form a coarse quadrilateral.
-5. Evaluate `TRI57` and `SQ60`, all eight dihedral orientations, and bounded
+2. Accept the camera bounds only when field evidence independently touches all
+   four image edges. Otherwise bin evidence in both axes and robustly fit top,
+   bottom, left, and right boundary lines.
+3. Intersect the fitted lines to form a coarse quadrilateral. Camera aspect ratio
+   is never accepted as field-boundary evidence.
+4. Evaluate `TRI49`, `TRI57`, and `SQ60`, all eight dihedral orientations, and bounded
    scale hypotheses.
-6. Remove the likely payload component by nearest-palette blind clustering.
-7. Correlate the residual signal against all sixteen geometry/phase PRBS
+5. Remove the likely payload component by nearest-palette blind clustering.
+6. Correlate the residual signal against all sixteen geometry/phase PRBS
    sequences.
-8. Shortlist geometry/orientation/phase candidates with the broad C16 reference,
-   then re-score the best eight with C8, C16, C24, and C32 palette models.
-9. Refine each corner by coordinate descent over decreasing sub-cell offsets.
-10. Reject correlation below `0.028` or resolution below `3.2 px/cell`.
+7. Shortlist geometry/orientation/phase candidates with the broad C16 reference,
+   then re-score the best 24 with C8, C16, C24, and C32 palette models. The
+   wider shortlist prevents a third geometry from displacing the correct
+   high-order-color candidate before profile-specific scoring.
+8. Refine each corner by coordinate descent over decreasing sub-cell offsets.
+9. Reject correlation below `0.028` or resolution below `3.2 px/cell`.
 
 For a tracked quadrilateral, only phase correlation is repeated on the selected
 lattice. Geometry is
@@ -208,18 +251,21 @@ carry error across the entire frame.
 
 The reader never compares pixels directly with fixed RGB constants.
 
-1. Estimate channel low/high quantiles from all 2,040 samples.
-2. Fit a bounded affine camera model per channel:
-
-   ```text
-   observed_c = gain_c * nominal_c + offset_c
-   ```
-
+1. Sample a bounded central kernel according to observed cell pitch: one pixel
+   below 8 px/cell, 3 x 3 at 8--18 px/cell, and 5 x 5 above 18 px/cell.
+2. Estimate channel low/high quantiles from all 2,040 samples and obtain a
+   diagonal bootstrap transform.
 3. Classify against the phase-specific dithered constellation.
 4. Keep the best and second-best distances.
-5. Select the most reliable 55% of decisions and refit gain/offset by linear
-   regression.
-6. Reclassify the full field.
+5. Select the most reliable 55% of decisions and fit a full 3 x 3 color mixing
+   matrix plus offset by regularized least squares:
+
+   ```text
+   observed_RGB = A(3x3) * nominal_RGB + offset_RGB
+   ```
+
+6. Reclassify the full field. If the full transform overfits, retry the diagonal
+   bootstrap model; MDS and CRC32 choose the valid candidate.
 
 For distances `d1 <= d2`, confidence and reliability are
 
@@ -234,9 +280,10 @@ substitutions.
 
 ## 7. Computational deblurring for touching cells
 
-The default sampler uses the predicted center pixel because a wide kernel can
-cross an edge when there is no physical guard gap. At low observed resolution,
-the receiver applies a bounded first-order inverse of nearest-neighbor leakage:
+The central kernel remains below the cell inradius so it suppresses sensor
+subpixel, demosaicing, and moire noise without intentionally crossing a cell
+edge. At low observed resolution, the receiver applies a bounded first-order
+inverse of nearest-neighbor leakage:
 
 ```text
 x_hat(i) = y(i) + lambda * (y(i) - mean(neighbors(i)))
@@ -325,8 +372,12 @@ Automated tests cover:
 - sixteen reversible masks;
 - MDS erasure recovery and reliability-guided hard-substitution recovery;
 - distributed phase acquisition without finder/timing patterns;
-- dedicated geometry correlation and decoding for both `TRI57` and `SQ60`;
+- dedicated geometry correlation and decoding for `TRI49`, `TRI57`, and `SQ60`;
 - display/camera channel gain and offset;
+- non-integer camera resampling, blur, RGB channel mixing, chromatic displacement,
+  lens shading, and sensor noise;
+- same-aspect projected fields, ensuring camera-frame aspect is not mistaken for
+  the actual optical-field boundary;
 - wider camera framing, 90-degree rotation, mild blur, and projective warp;
 - real RFC 6330 reconstruction after systematic loss and packet reordering;
 - frame and reconstructed-object CRC32 validation.

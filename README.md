@@ -21,8 +21,9 @@ content off the local device.
 - `docs/`: product boundary, architecture, commercial model, and operations.
 
 The public browser experiment now uses one borderless 2,040-cell dynamic optical
-field. Its default is an affine-triangular sample lattice with full-area
-hexagonal Voronoi cells; a square lattice remains as a measured fallback. It
+field. Its default is a near-balanced 20:13 outer rectangle with a 49/48-center
+affine-triangular lattice and full-area hexagonal Voronoi cells; wide triangular
+and square lattices remain measured fallbacks. It
 intentionally drops ordinary QR and Micro QR reader compatibility: all cells
 carry protected data, while geometry, phase, and color references are weak
 distributed sequences superimposed over the field. The
