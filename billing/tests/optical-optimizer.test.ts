@@ -8,7 +8,7 @@ describe("joint optical capture optimizer", () => {
       cellErasureRate: 0.005,
       frameDetectionRate: 0.99,
       meanConfidence: 14,
-      qrDetectionMs: 80,
+      geometryDetectionMs: 80,
       chromaDecodeMs: 22,
       motionRisk: 0.002,
     });
@@ -25,7 +25,7 @@ describe("joint optical capture optimizer", () => {
       cellErasureRate: 0.01,
       frameDetectionRate: 0.95,
       meanConfidence: 7,
-      qrDetectionMs: 4,
+      geometryDetectionMs: 4,
       chromaDecodeMs: 10,
       motionRisk: 0.9,
     });
@@ -49,7 +49,7 @@ describe("joint optical capture optimizer", () => {
       cellErasureRate: 0.002,
       frameDetectionRate: 0.99,
       meanConfidence: 15,
-      qrDetectionMs: 12,
+      geometryDetectionMs: 12,
       chromaDecodeMs: 18,
       motionRisk: 0.01,
     });
@@ -57,7 +57,7 @@ describe("joint optical capture optimizer", () => {
       cellErasureRate: 0.08,
       frameDetectionRate: 0.7,
       meanConfidence: 2,
-      qrDetectionMs: 20,
+      geometryDetectionMs: 20,
       chromaDecodeMs: 35,
       motionRisk: 0.3,
     });

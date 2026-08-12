@@ -1,8 +1,9 @@
 import {
-  LAB_INNER_CODEWORD_BYTES,
   LAB_INNER_PARITY_BYTES,
+  LAB_INNER_STRIPE_CODEWORD_BYTES,
+  LAB_INNER_STRIPE_COUNT,
   LAB_ACTIVE_QUIET_MODULES,
-  LAB_QR_MODULES,
+  LAB_SYMBOL_MODULES,
   LAB_SOURCE_CHUNK_BYTES,
 } from "./optical-lab";
 
@@ -14,7 +15,7 @@ export type ChannelEstimate = Readonly<{
   cellErasureRate: number;
   frameDetectionRate: number;
   meanConfidence: number;
-  qrDetectionMs: number;
+  geometryDetectionMs: number;
   chromaDecodeMs: number;
   motionRisk: number;
 }>;
@@ -36,20 +37,21 @@ export type CapturePolicy = Readonly<{
  */
 export function optimizeCapturePolicy(observationInput: ChannelEstimate): CapturePolicy {
   const observation = validateObservation(observationInput);
-  const byteErasureRate = 1 - ((1 - observation.cellErasureRate) ** 4);
-  const innerSuccess = estimateMdsSuccessProbability(
-    LAB_INNER_CODEWORD_BYTES,
+  const byteErasureRate = 1 - ((1 - observation.cellErasureRate) ** 2);
+  const stripeSuccess = estimateMdsSuccessProbability(
+    LAB_INNER_STRIPE_CODEWORD_BYTES,
     LAB_INNER_PARITY_BYTES,
     byteErasureRate,
   );
-  const symbolSide = LAB_QR_MODULES + (2 * LAB_ACTIVE_QUIET_MODULES);
+  const innerSuccess = stripeSuccess ** LAB_INNER_STRIPE_COUNT;
+  const symbolSide = LAB_SYMBOL_MODULES + (2 * LAB_ACTIVE_QUIET_MODULES);
   const symbolArea = symbolSide ** 2;
   let selected: CapturePolicy | null = null;
 
   for (const targetFps of CANDIDATE_FPS) {
     for (const geometryRelockInterval of CANDIDATE_RELOCK_INTERVALS) {
       const meanProcessingMs = observation.chromaDecodeMs
-        + (observation.qrDetectionMs / geometryRelockInterval);
+        + (observation.geometryDetectionMs / geometryRelockInterval);
       const processingLimitedFps = 1000 / Math.max(1, meanProcessingMs);
       const effectiveFps = Math.min(targetFps, processingLimitedFps);
       const trackedFrameSurvival = geometryRelockInterval === 1

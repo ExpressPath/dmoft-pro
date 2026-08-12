@@ -1,351 +1,381 @@
-# Prism Joint-Max Dynamic Color QR
+# Prism C16 Custom Dynamic Optical Profile
 
-Status: experimental browser profile (`PRISM-C8-QR-RX5`)
+Status: implemented experimental browser profile (`PRISM-C16-CUSTOM-R1`)
 
-This document specifies the implemented optimization that jointly improves
-area efficiency, inner error recovery, and reading speed. It distinguishes
-measured implementation facts from channel-model predictions.
+This profile intentionally does **not** preserve ISO QR or Micro QR reader
+compatibility. It keeps proven QR-family ideas—finder ratios, timing references,
+quiet-zone isolation, masking, interleaving, and erasure-oriented decoding—but
+uses the complete integrated symbol as a custom dynamic 16-state optical PHY.
 
-## 1. Joint objective
-
-Density, redundancy, and frame rate are not optimized independently. For a
-profile `theta` and measured channel state `z`, the controller maximizes
+The implemented objective is
 
 ```text
 eta(theta | z)
-  = sourceBytes(theta)
-    * effectiveFPS(theta, z)
-    * P(frame accepted | theta, z)
-    / symbolArea(theta)
+  = E[authenticated or CRC-verified source bytes]
+    / (display area * capture time)
 ```
 
-The numerator counts only source bytes from a frame that passes geometry,
-inner-FEC, and CRC checks. A denser but rejected frame contributes zero.
+The browser lab currently verifies frames and the reconstructed test object
+with CRC32. It does not yet claim cryptographic authentication; a production
+DMOFT container must add receiver-bound encryption and AEAD before final output.
 
-The implemented decision variables are:
+## 1. Design constraints
+
+The encoder and reader jointly enforce these invariants:
+
+1. one square optical symbol, not a QR plus a separate color panel;
+2. black and white are payload states, not only control colors;
+3. all sixteen payload states carry four bits per module;
+4. monochrome function modules remain readable under severe color distortion;
+5. uncertain colors become erasures instead of forced substitutions;
+6. every accepted frame passes inner MDS checks, profile validation, and CRC32;
+7. dynamic frames may be received out of order and decoding may start anywhere;
+8. density is increased only when verified throughput also increases.
+
+The current robust mobile profile fixes the color count at sixteen. This is the
+largest implemented alphabet, not a claim that sixteen is optimal on every
+camera. A future negotiated profile may drop to eight or four states when the
+measured camera-space constellation is not sufficiently separated.
+
+## 2. Integrated geometry
+
+### 2.1 Grid
 
 ```text
-theta = (QR version, quiet zone, palette, inner code,
-         target FPS, geometry relock interval, erasure threshold, mask)
+logical grid             41 x 41 modules
+quiet zone               2 modules per side
+display footprint        45 x 45 module pitches
+browser module pitch     16 pixels
+display image            720 x 720 pixels
+colored core             14 / 16 = 0.875 module width
 ```
 
-The current optical carrier fixes the first four variables for interoperability
-and searches the remaining variables at runtime.
+The two-module quiet zone and compact in-grid control layout apply the area
+reduction principle of Micro QR without claiming Micro QR conformance. Unlike
+Micro QR, the robust camera profile uses four 7 x 7 finders because a live
+handheld reader needs four directly observed correspondences for stable
+projective recovery. A one-finder compact mode is not enabled until it can
+match this acquisition reliability on the device benchmark matrix.
 
-## 2. Geometry and area allocation
+### 2.2 Function modules
 
-### 2.1 Stable luminance bootstrap
+The grid reserves:
 
-The previous profile embedded session, sequence, and mask metadata in the QR
-URL. That forced a Version 10/H luminance matrix and regenerated a different QR
-matrix for every mask candidate and every frame.
+- four monochrome 7 x 7 finders with 1:1:3:1:1 scan ratios;
+- one-module white separators inside the symbol boundary;
+- asymmetric horizontal and vertical timing rails;
+- a 3 x 5 orientation signature;
+- no changing URL, sequence number, or mask metadata in the monochrome plane.
 
-`RX5` keeps dynamic control inside the protected chroma packet. The QR
-luminance plane is the constant same-origin URL:
+All four finders remain visible in every dynamic frame. There is no beacon
+frame that temporarily stops data transmission.
+
+The function/data allocation is:
 
 ```text
-https://<deployment-origin>/o
+total logical modules       1681
+monochrome function modules  320
+calibration pilots           124
+payload modules             1237
+FEC codeword modules        1230
+deterministic filler           7
 ```
 
-`/o` redirects to `/optical-lab?role=reader`. The stable URL fits Version 5/H,
-so the carrier falls from 57 x 57 to 37 x 37 modules while retaining standard
-three-finder QR detection, timing, alignment, masking, and level-H
-Reed-Solomon protection for the luminance bootstrap.
+Thus 99.43% of the available payload modules carry the protected codeword.
 
-The acquisition profile uses the standard four-module QR quiet zone. A
-two-module margin is valid for Micro QR's different geometry, but applying it
-to a normal three-finder Version 5 symbol reduced real camera acquisition.
-Compact two-module operation is therefore disabled until negotiated from
-measured receiver capability; this profile does not claim Micro QR conformance.
+### 2.3 Homography
 
-### 2.2 Area equations
-
-The previous `MICROTECH2` footprint was
+Finder centers in logical module coordinates are
 
 ```text
-L_old = 57 + 2*2 = 61 modules
-A_old = 61^2 = 3721 module-pitches^2
+(3.5, 3.5), (37.5, 3.5), (37.5, 37.5), (3.5, 37.5)
 ```
 
-The current footprint is
+For detected image centers `p_i`, the reader solves the eight-parameter
+homography `H` from
 
 ```text
-L_new = 37 + 2*4 = 45 modules
-A_new = 45^2 = 2025 module-pitches^2
+p_i ~ H q_i
 ```
 
-Therefore the same-pitch footprint efficiency is
+and samples every pilot and payload cell through `H`. The reader rejects a
+symbol below 3.5 observed pixels/module or with a maximum/minimum side ratio
+above 2.4.
+
+## 3. Four-finder acquisition
+
+The custom reader does not call `BarcodeDetector` or `jsQR`.
+
+1. Convert the camera image to luma.
+2. Compute an Otsu threshold, constrained to `[72, 190]`.
+3. Scan rows for dark/light runs matching `1:1:3:1:1`.
+4. Cross-check each candidate vertically and horizontally.
+5. Cluster repeated observations and require at least two votes.
+6. Evaluate four-candidate quadrilaterals using side length, diagonal balance,
+   area, and module-size consistency.
+7. Test all eight dihedral orientations (four rotations and four reflections).
+8. Project the reserved timing/orientation modules and select the orientation
+   with the largest monochrome agreement score.
+9. Reject orientation agreement below 0.72.
+
+This directly removes the former failure mode in which a valid color carrier
+was discarded because a complete ordinary QR payload could not be decoded.
+The acquisition stage needs only the custom monochrome geometry.
+
+For handheld capture the receiver relocks geometry every processed frame. A
+previous homography may be reused for at most two frames and 260 ms after a
+single detector miss; it is never retained through a geometry or sampling
+failure.
+
+## 4. Sixteen-state modulation
+
+### 4.1 Alphabet
+
+The nominal palette is
 
 ```text
-G_area = A_old / A_new = (61/45)^2 = 1.8375
+black, maroon, red, orange,
+yellow, lime, green, teal,
+cyan, sky blue, blue, violet,
+magenta, pink, gray, white
 ```
 
-The source payload per accepted frame changes from 256 to 174 bytes. The
-verified source density therefore improves by
+The nominal minimum CIE Lab Delta-E distance is 27.22. The runtime calibration
+rejects a frame if any estimated palette pair is closer than 18 in its current
+camera-space separation check.
+
+Each payload state `s in [0,15]` carries one hexadecimal digit:
 
 ```text
-G_source-density
-  = (174 / 45^2) / (256 / 61^2)
-  = 1.2492
+I_raw = log2(16) = 4 bits/module
 ```
 
-This is the meaningful area result: **24.9% more verified source bytes per
-symbol area per accepted frame**, not a claim that every frame carries more
-absolute bytes.
+Every non-function module is first painted neutral gray. Its central 87.5%
+width is then painted with the selected state, leaving a one-pixel guard on
+each side at the browser reference pitch. Function modules are full-cell black
+or white.
 
-### 2.3 Calibration allocation
+### 4.2 Global and local calibration
 
-Version 5/H exposes 1,079 non-function modules for this bootstrap. The current
-matrix reserves:
+The grid contains 64 global pilots: four spatial observations for each of the
+sixteen states. A trimmed RGB estimator produces `mu_j` and a diagonal variance
+model for each state.
 
-- 32 global pilots: four quadrants for each of eight palette states;
-- 44 local pilots: one black and one white anchor in each eligible 8 x 8 tile;
-- 1,003 chroma payload cells.
-
-The global pilots estimate all eight camera-space color distributions. A tile's
-black and white anchors estimate per-channel gain and offset, which transforms
-the global model into a local palette. No external calibration strip or second
-QR code exists.
-
-## 3. Dual-use color modulation
-
-Every non-function module preserves its QR luminance bit and adds two chroma
-bits. The entire module is first painted black or white according to the QR
-bit; only the central `14/16 = 0.875` width is painted with the chroma state.
-The one-pixel-per-side luminance guard suppresses display bleed without
-fragmenting the QR data plane:
+Sixty local pilots provide black/white pairs in eligible 8 x 8 tiles. For
+channel `c`, the tile gain is
 
 ```text
-QR DARK  -> {black, red, dark green, blue}
-QR LIGHT -> {white, yellow, cyan, magenta}
+g_c = clamp(
+  (white_local,c - black_local,c)
+  / max(24, white_global,c - black_global,c),
+  0.35,
+  2.5
+)
 ```
 
-For observation `x`, palette state `j` is scored by diagonal Mahalanobis
-distance
+The local palette is an affine transform of the global palette. A damaged
+local pair falls back to the global model rather than invalidating the frame.
+
+### 4.3 Soft classification
+
+For observation `x` and palette state `j`, the decoder computes
 
 ```text
-d_j(x) = sum_c (x_c - mu_j,c)^2 / sigma_j,c^2
-```
-
-with confidence
-
-```text
+d_j(x) = sum_c (x_c - mu_j,c)^2 * inverseVariance_j,c
 confidence(x) = d_second(x) - d_best(x)
 ```
 
-Classification is restricted to the four states allowed by the already-known
-QR luminance bit. A cell becomes an erasure when either the best/second-best
-margin is too small or the absolute normalized distance from every allowed
-state is too large. Pilot patches use channel medians and the four spatial
-samples per state use a trimmed estimator, limiting glare sensitivity.
-
-## 4. Inner Cauchy-MDS erasure code
-
-### 4.1 Frame layout
-
-One accepted chroma frame carries:
+A state becomes an erasure when either
 
 ```text
-32-byte protected frame header
-174-byte outer source/repair symbol
-4-byte CRC32
-= 210 data octets
+confidence(x) < erasureThreshold
 ```
 
-The encoder appends 40 parity octets:
+or
 
 ```text
-[n, k] = [250, 210]
-R_inner = 210 / 250 = 0.84
+d_best(x) > 36
 ```
 
-The 250-byte codeword maps to exactly 1,000 quaternary cells. Three of the
-1,003 available payload cells remain deterministic mask-balanced filler.
+The reader retains `confidence / (1 + d_best)` as byte reliability for the
+bounded soft-erasure chase.
 
-The previous implementation transmitted two 320-byte packet copies, a code
-rate of 0.50. The new inner redundancy is 16% of the transmitted codeword
-instead of a 100% duplicate.
+## 5. Frame packing and inner FEC
 
-### 4.2 Field and generator
+### 5.1 Protected packet
 
-Arithmetic uses `GF(2^8)` with primitive polynomial `0x11d`. The systematic
-generator is
+One dynamic frame contains
+
+```text
+32-byte frame/control header
+480-byte systematic or repair source symbol
+4-byte frame CRC32
+= 516 data bytes
+```
+
+The packet is divided into three 172-byte stripes. Each stripe is encoded as a
+systematic Cauchy MDS code over `GF(2^8)`:
+
+```text
+[n, k] = [205, 172]
+parity  = 33 bytes/stripe
+R_inner = 516 / 615 = 0.8390
+```
+
+The three codewords total 615 bytes, which map to 1,230 hexadecimal color
+modules. Each stripe can recover any 33 known byte erasures when all other
+symbols are available.
+
+The Cauchy generator is
 
 ```text
 G = [I_k ; C]
-```
-
-where the Cauchy parity matrix is
-
-```text
 C[r,c] = 1 / (x_r + y_c)
-y_c = c
-x_r = k + r
 ```
 
-and field addition is XOR. The `x` and `y` sets are disjoint because
-`n <= 256`; every square submatrix of `C` is nonsingular, giving the required
-MDS erasure property.
+using primitive polynomial `0x11d` with disjoint `x` and `y` sets. Received
+parity is recomputed after recovery. The packet is accepted only after frame
+structure and CRC32 also agree.
 
-The decoder keeps known systematic octets, builds only the `u x u` system for
-the `u` missing data octets, and solves it with Gaussian elimination in
-`GF(256)`. Recovery succeeds when
+### 5.2 Reliability chase
+
+Two four-bit cells form one GF(256) byte. If hard classifications fail MDS or
+CRC validation, bytes are ranked by the minimum reliability of their two
+cells. The reader retries bounded erasure depths from
 
 ```text
-u <= number of received parity octets
+{0, 1, 2, 4, 8, 12, 20, 28, budget}
 ```
 
-All received parity is recomputed after recovery. If the first parity check
-fails, the decoder ranks codeword bytes by the minimum reliability of their
-four chroma cells and performs a bounded chase at erasure depths
-`{2,4,8,12,20,28,36,40}`. A hard substitution can therefore be recovered when
-it lies in the low-reliability set. This remains an erasure decoder with a
-soft-decision wrapper; it does not claim general algebraic unknown-error
-correction.
+independently within each stripe. This can recover likely hard substitutions
+without claiming a general unknown-error decoder. A candidate is valid only if
+its embedded mask ID, three MDS stripes, frame profile, and CRC all agree.
 
-### 4.3 Erasure acceptance model
+### 5.3 Acceptance model
 
-If a quaternary cell has erasure probability `e`, a four-cell byte is erased
-with probability
+If cell erasure probability is `e`, byte erasure probability is estimated as
 
 ```text
-q = 1 - (1-e)^4
+q = 1 - (1-e)^2
 ```
 
-A conservative independent-erasure estimate is
+For one stripe,
 
 ```text
-P_inner(q)
-  = sum from i=0 to 40 of C(250,i) q^i (1-q)^(250-i)
+P_stripe(q)
+  = sum(i=0..33) C(205,i) q^i (1-q)^(205-i)
 ```
 
-The implementation evaluates this binomial CDF when choosing the capture
-policy. Spatial hashing interleaves adjacent codeword symbols across the QR
-matrix to reduce burst correlation. The binomial model remains optimistic for
-large correlated glare regions, so physical benchmarks must also report burst
-length and tile-level loss.
-
-## 5. Chroma mask optimization
-
-The luminance matrix is constant, but every frame evaluates 16 reversible
-chroma masks. For mask `m`, the encoder maximizes a score of the form
+and the conservative independent-stripe estimate is
 
 ```text
-J(m) = sum_(u,v in spatial edges) DeltaE(color_u, color_v)
-     + lambda_t * sum_u DeltaE(color_u,t, color_u,t-1)
-     - lambda_s * sameColorAdjacency
-     - lambda_b * withinClassImbalance
+P_inner = P_stripe^3
 ```
 
-This spreads similar colors spatially and temporally without changing the QR
-dark/light plane. The selected mask ID is inside the MDS-protected packet. The
-receiver tries the 16 inverse masks and accepts only the candidate whose MDS
-parity, frame profile, embedded mask ID, and CRC all agree.
+Physical benchmarks must still measure correlated glare and blur because the
+binomial model assumes independent erasures.
 
-## 6. Reading-speed controller
+## 6. Spatial and temporal masks
 
-### 6.1 Multi-path acquisition and handheld geometry policy
-
-A failed full QR decode does not prove that the finder patterns are absent.
-The failure may occur later in extraction, luminance classification, QR
-Reed-Solomon recovery, or bootstrap parsing. `RX5` therefore reports QR
-bootstrap acquisition separately from chroma and inner-FEC stages.
-
-Each relock evaluates the following acquisition chain:
+Every frame evaluates sixteen reversible hexadecimal masks. For candidate `m`,
+the encoder scores
 
 ```text
-native mobile QR detector (when available)
-  -> centered raw RGB/grayscale QR decode
-  -> centered normalized max-channel carrier decode
-  -> full-frame raw decode
-  -> full-frame normalized max-channel carrier decode
-  -> bounded reuse of the last authenticated bootstrap geometry
+J(m)
+  = sum_spatial DeltaE(state_u, state_v)
+  + 0.28 * sum_temporal DeltaE(state_u,t, state_u,t-1)
+  - 150 * same-state adjacency
+  - 0.9 * palette histogram imbalance
 ```
 
-The centered search matches the visible camera guide. The carrier projection
-first normalizes each RGB channel at its observed 98th percentile and computes
+The highest-scoring candidate is rendered. The selected mask ID is protected
+inside the frame, while the receiver can infer it by trying all sixteen inverse
+masks and requiring full MDS/profile/CRC agreement.
+
+Payload codeword cells are spatially hash-interleaved, so consecutive bytes do
+not occupy one contiguous glare-sensitive region.
+
+## 7. Dynamic outer repair
+
+The test object contains eight 480-byte source symbols:
 
 ```text
-v(x) = max(R/R_98, G/G_98, B/B_98)
+object size = 8 * 480 = 3840 bytes
 ```
 
-The RX5 palette constrains chromatic dark-state peaks below the carrier guard
-band and chromatic light-state peaks above it. The projection threshold is
-therefore clamped inside that deliberately empty band rather than being allowed
-to collapse toward the large black finder population.
+Frames 0 through 7 are systematic. Later frames contain deterministic XOR
+equations of degree two through five. The decoder performs GF(2) elimination,
+accepts frames out of order, ignores duplicate sequences, and reconstructs once
+rank reaches eight. Row insertion eliminates every existing pivot before a new
+pivot is committed, preventing false full-rank states.
 
-A frozen four-corner homography is not long-term tracking. However, discarding
-a valid location after one transition frame also destroys synchronization.
-RX5 reuses a detected location for at most three processed frames and 360 ms.
-Geometry or sampling failures invalidate it immediately. This is short enough
-to bound handheld drift while bridging an exposure that overlaps a color
-transition.
+This outer code is an implemented startless engineering code, not RaptorQ.
+Standards-oriented production work should replace it with a reviewed RaptorQ
+or equivalent fountain implementation while retaining the optical PHY.
 
-The sender also inserts one pure monochrome acquisition beacon before every
-four chroma payload frames. The beacon occupies the same Version 5 QR symbol;
-it is temporal control-plane redundancy, not a second code or extra screen
-region. Sequence numbers advance only on payload frames, so a beacon cannot
-silently consume a source or repair symbol.
+## 8. Area and throughput result
 
-### 6.2 Processing and acceptance model
-
-For target frame rate `f`, chroma decode time `t_c`, and QR detection time
-`t_q`, the processing-limited rate is
+The prior 61-module footprint had
 
 ```text
-f_effective = min(f, 1000 / (t_c + t_q))
+A_old = 61^2 = 3721 module-pitches^2
+source_old = 256 bytes/frame
 ```
 
-The controller evaluates
+The C16 footprint has
 
 ```text
-f in {4, 6, 8, 10}
-r = 1, with bounded 3-frame / 360-ms geometry reuse after a missed relock
+A_C16 = 45^2 = 2025 module-pitches^2
+source_C16 = 480 bytes/frame
 ```
 
-and maximizes
+Therefore
 
 ```text
-eta(f)
-  = 174 * f_effective * P_detect * P_inner / 45^2
+G_area = 3721 / 2025 = 1.8375
+
+G_verified-density
+  = (480 / 2025) / (256 / 3721)
+  = 3.4454
 ```
 
-Measured QR time, chroma time, frame-detection rate, mean confidence, and cell
-erasure rate are updated online. The selected FPS directly controls the camera
-loop. Decoder diagnostics separately count finder, geometry, calibration,
-sampling, and inner-FEC failures so a rejected frame has a visible cause.
+Against the former RX5 source payload of 174 bytes in the same 45 x 45
+footprint, accepted payload per frame is
 
-## 7. Measured implementation delta
+```text
+480 / 174 = 2.7586 times
+```
 
-On the same development machine and Node process, frame preparation measured:
+These are implementation capacity ratios, not measured handheld throughput.
+The runtime controller still maximizes
 
-| Profile | Mean preparation | Compute ceiling | Notes |
-| --- | ---: | ---: | --- |
-| `MICROTECH2` | 328.72 ms | 3.04 FPS | dynamic V10 QR regenerated for 16 masks |
-| `JOINTMAX3` | 64.40 ms | 15.53 FPS | historical unguarded 2-module-margin profile |
-| `RX4` | pending device matrix | target 10 FPS | guarded chroma, 4-module acquisition, destructive relock failure |
-| `RX5` | pending device matrix | target 10 display FPS | iso-luminant chroma, 1:4 monochrome beacon, native/carrier fallback, bounded tracking |
+```text
+verifiedRate
+  = 480 * effectiveFPS * P(finder) * P_inner
+```
 
-This is a CPU preparation microbenchmark, not camera throughput. It establishes
-that the original encoder computation bottleneck was removed; real effective
-throughput still requires device-pair measurements.
+over 4, 6, 8, and 10 FPS. A frame failing geometry, calibration, MDS, profile,
+or CRC contributes zero.
 
-## 8. Outer repair and authentication boundary
+## 9. Verification scope
 
-The browser laboratory still uses eight source symbols and a startless
-systematic `GF(2)` XOR repair stream across frames. It is not RaptorQ. Production
-work should replace this with a reviewed RFC 6330 implementation while keeping
-the inner Cauchy-MDS code for cell/byte erasures.
+Automated tests currently cover:
 
-CRC32 verifies laboratory reconstruction and mask inference. It is not
-cryptographic authentication. The encrypted-container pipeline must still
-perform receiver-bound key decapsulation, manifest authentication, chunk AEAD,
-whole-object digest verification, and safe temporary-file handling before a
-file is saved.
+- direct 16-state encode/decode and all sixteen reversible masks;
+- three-stripe MDS erasure recovery and bounded hard-substitution recovery;
+- rejection beyond a stripe's repair budget;
+- frame and reconstructed-object CRC rejection;
+- out-of-order repair-only outer reconstruction;
+- four-finder acquisition in centered and wide camera frames;
+- 90-degree rotation, reflection, projective warp, channel gain/offset, and
+  mild optical blur;
+- exact homography projection and adaptive throughput calculations.
 
-## 9. Primary references
+Still required before a production claim:
 
-- [RFC 5510: Reed-Solomon FEC Schemes](https://www.rfc-editor.org/info/rfc5510/)
-- [RFC 6330: RaptorQ FEC Scheme](https://www.rfc-editor.org/info/rfc6330/)
-- [DENSO WAVE: QR geometry and correction](https://www.denso.com/global/home/business/innovation/qrcode/)
-- [DENSO WAVE: Micro QR Code](https://www.qrcode.com/en/codes/microqr.html)
+- the full iOS/Android/OLED/LCD physical benchmark matrix;
+- rolling-shutter and display-refresh phase measurements;
+- correlated glare/occlusion measurements;
+- camera-specific palette negotiation and C16 to C8/C4 fallback;
+- authenticated encrypted-container integration;
+- independent protocol and cryptographic review.

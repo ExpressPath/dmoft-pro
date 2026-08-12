@@ -3,8 +3,8 @@ import type { Metadata } from "next";
 import { OpticalLab } from "./optical-lab";
 
 export const metadata: Metadata = {
-  title: "Integrated Dynamic Color QR Lab",
-  description: "A single QR-family matrix combining QR luminance geometry with an eight-state dynamic chroma payload.",
+  title: "Prism C16 Dynamic Optical Lab",
+  description: "A custom 41 x 41 optical stream with four-finder geometry, sixteen-state color payloads, and triple-stripe error correction.",
 };
 
 export default async function OpticalLabPage({

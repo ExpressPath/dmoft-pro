@@ -20,10 +20,12 @@ content off the local device.
   license refresh, and customer-portal service.
 - `docs/`: product boundary, architecture, commercial model, and operations.
 
-The public browser experiment uses one integrated QR-family matrix rather than
-a QR beside a separate color panel. Its luminance/chroma invariants and current
+The public browser experiment uses one custom 41 x 41 optical symbol rather
+than a QR beside a separate color panel. It intentionally drops ordinary QR
+reader compatibility so black, white, and fourteen additional colors can all
+carry four-bit payload symbols. Its geometry, calibration, error recovery, and
 capacity are specified in
-[the integrated Dynamic Color QR profile](docs/design/INTEGRATED_DYNAMIC_COLOR_QR.md).
+[the Prism C16 custom dynamic profile](docs/design/INTEGRATED_DYNAMIC_COLOR_QR.md).
 
 ## Community and Pro boundary
 

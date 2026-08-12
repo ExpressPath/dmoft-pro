@@ -1,18 +1,14 @@
-import jsQR from "jsqr";
-
 import {
-  LAB_CHROMA_RADIX,
   LAB_ERASURE_THRESHOLD,
-  LAB_FRAME,
   LAB_PALETTE_SIZE,
-  LAB_QR_MODULES,
+  LAB_SYMBOL_MODULES,
+  PRISM_FINDER_CENTERS,
   classifyColor,
-  createIntegratedQrMatrix,
-  decodeIntegratedPaletteSymbols,
+  createPrismMatrix,
+  decodePrismPaletteSymbols,
   estimatePalette,
   localizePalette,
-  moduleCenter,
-  parseBootstrapUrl,
+  logicalModuleCenter,
   projectPoint,
   solveHomography,
   type FrameGridDecode,
@@ -26,6 +22,8 @@ export type CameraPixelImage = Readonly<{
   height: number;
 }>;
 
+// The four points are finder centers in logical TL, TR, BR, BL order. They are
+// deliberately not outer QR corners because this profile is not a QR Code.
 export type QrLocation = Readonly<{
   topLeftCorner: Point;
   topRightCorner: Point;
@@ -33,15 +31,14 @@ export type QrLocation = Readonly<{
   bottomLeftCorner: Point;
 }>;
 
-export type QrAcquisitionMode = "center-raw" | "center-carrier" | "full-raw" | "full-carrier";
-
-export type QrAcquisition = Readonly<{
-  data: string;
+export type PrismAcquisition = Readonly<{
   location: QrLocation;
-  mode: QrAcquisitionMode;
+  mode: "custom-four-finder";
+  finderScore: number;
+  orientationScore: number;
 }>;
 
-export type OpticalDecodeStage = "geometry" | "bootstrap" | "calibration" | "sampling" | "inner-fec";
+export type OpticalDecodeStage = "geometry" | "calibration" | "sampling" | "inner-fec";
 
 export class OpticalDecodeError extends Error {
   constructor(
@@ -62,121 +59,73 @@ export type DecodedCameraFrame = Readonly<{
   sampleRadius: number;
 }>;
 
-const QR_SOURCE_CORNERS: readonly Point[] = [
-  { x: LAB_FRAME.qrX, y: LAB_FRAME.qrY },
-  { x: LAB_FRAME.qrX + LAB_FRAME.qrSize, y: LAB_FRAME.qrY },
-  { x: LAB_FRAME.qrX + LAB_FRAME.qrSize, y: LAB_FRAME.qrY + LAB_FRAME.qrSize },
-  { x: LAB_FRAME.qrX, y: LAB_FRAME.qrY + LAB_FRAME.qrSize },
-];
+type FinderCandidate = {
+  x: number;
+  y: number;
+  moduleSize: number;
+  votes: number;
+};
 
-const CENTER_SEARCH_RATIO = 0.96;
+type PatternCrossCheck = Readonly<{
+  center: number;
+  moduleSize: number;
+  total: number;
+}>;
 
-/**
- * Locates and decodes the monochrome QR control plane without assuming that
- * camera RGB values preserve the display's grayscale luminance. The centered
- * attempts match the on-screen camera guide and reduce both search noise and
- * latency. The max-channel carrier projection is a fallback for saturated
- * chroma states whose ordinary grayscale values cross a QR threshold.
- */
-export function acquireQr(image: CameraPixelImage): QrAcquisition | null {
+const FINDER_DISTANCE_MODULES = LAB_SYMBOL_MODULES - 7;
+
+export function locatePrismSymbol(image: CameraPixelImage): PrismAcquisition | null {
   validateImage(image);
-  const center = centeredSquare(image, CENTER_SEARCH_RATIO);
-  const attempts: ReadonlyArray<Readonly<{
-    source: CameraPixelImage;
-    carrier: boolean;
-    offsetX: number;
-    offsetY: number;
-    mode: QrAcquisitionMode;
-  }>> = [
-    {
-      source: center.image,
-      carrier: false,
-      offsetX: center.offsetX,
-      offsetY: center.offsetY,
-      mode: "center-raw",
-    },
-    {
-      source: center.image,
-      carrier: true,
-      offsetX: center.offsetX,
-      offsetY: center.offsetY,
-      mode: "center-carrier",
-    },
-    { source: image, carrier: false, offsetX: 0, offsetY: 0, mode: "full-raw" },
-    { source: image, carrier: true, offsetX: 0, offsetY: 0, mode: "full-carrier" },
-  ];
-
-  const seen = new Set<string>();
-  for (const attempt of attempts) {
-    const key = `${attempt.source.width}:${attempt.source.height}:${attempt.carrier ? "carrier" : "raw"}`;
-    if (seen.has(key)) continue;
-    seen.add(key);
-    const attemptImage = attempt.carrier ? projectColorCarrier(attempt.source) : attempt.source;
-    const pixels = attemptImage.data instanceof Uint8ClampedArray
-      ? attemptImage.data
-      : Uint8ClampedArray.from(attemptImage.data);
-    const qr = jsQR(pixels, attemptImage.width, attemptImage.height, {
-      inversionAttempts: "dontInvert",
-    });
-    if (!qr) continue;
-    return {
-      data: qr.data,
-      location: offsetLocation(qr.location as QrLocation, attempt.offsetX, attempt.offsetY),
-      mode: attempt.mode,
-    };
-  }
-  return null;
+  const grayscale = toGrayscale(image);
+  const threshold = otsuThreshold(grayscale);
+  const binary = Uint8Array.from(grayscale, (value) => value <= threshold ? 1 : 0);
+  const candidates = scanFinderCandidates(binary, image.width, image.height);
+  const selected = selectFinderQuad(candidates);
+  if (!selected) return null;
+  const oriented = orientFinderQuad(grayscale, image.width, image.height, threshold, selected.points);
+  if (!oriented || oriented.orientationScore < 0.72) return null;
+  return {
+    location: pointsToLocation(oriented.points),
+    mode: "custom-four-finder",
+    finderScore: selected.score,
+    orientationScore: oriented.orientationScore,
+  };
 }
 
 export function decodeCameraImage(
   image: CameraPixelImage,
   location: QrLocation,
-  bootstrap: string,
-  expectedOrigin: string,
   erasureThreshold = LAB_ERASURE_THRESHOLD,
 ): DecodedCameraFrame {
   validateImage(image);
-  let matrix;
-  try {
-    parseBootstrapUrl(bootstrap, expectedOrigin);
-    matrix = createIntegratedQrMatrix(bootstrap);
-  } catch (error) {
-    throw staged("bootstrap", error);
-  }
-
-  const destination = [
-    location.topLeftCorner,
-    location.topRightCorner,
-    location.bottomRightCorner,
-    location.bottomLeftCorner,
-  ];
+  const destination = locationPoints(location);
   const sideLengths = destination.map((corner, index) => distance(corner, destination[(index + 1) % 4]));
   const minimumSide = Math.min(...sideLengths);
   const maximumSide = Math.max(...sideLengths);
-  const observedModulePixels = minimumSide / LAB_QR_MODULES;
+  const observedModulePixels = minimumSide / FINDER_DISTANCE_MODULES;
   if (observedModulePixels < 3.5) {
     throw new OpticalDecodeError(
       "geometry",
-      `code is too small (${observedModulePixels.toFixed(1)} px/module; need at least 3.5)`,
+      `custom symbol is too small (${observedModulePixels.toFixed(1)} px/module; need at least 3.5)`,
     );
   }
-  if (maximumSide / Math.max(1, minimumSide) > 2.2) {
-    throw new OpticalDecodeError("geometry", "viewing angle is too steep for reliable module sampling");
+  if (maximumSide / Math.max(1, minimumSide) > 2.4) {
+    throw new OpticalDecodeError("geometry", "viewing angle is too steep for reliable custom-grid sampling");
   }
 
   let homography: readonly number[];
   try {
-    homography = solveHomography(QR_SOURCE_CORNERS, destination);
+    homography = solveHomography(PRISM_FINDER_CENTERS, destination);
   } catch (error) {
     throw staged("geometry", error);
   }
-  const sampleRadius = Math.max(1, Math.min(5, Math.floor(observedModulePixels * 0.16)));
-
+  const matrix = createPrismMatrix();
+  const sampleRadius = Math.max(1, Math.min(5, Math.floor(observedModulePixels * 0.14)));
   const globalSamples: Rgb[][] = Array.from({ length: LAB_PALETTE_SIZE }, () => []);
   const tileSamples = new Map<string, Map<number, Rgb>>();
   try {
     for (const pilot of matrix.pilots) {
-      const observed = sampleRgb(image, projectPoint(homography, moduleCenter(pilot)), sampleRadius);
+      const observed = sampleRgb(image, projectPoint(homography, logicalModuleCenter(pilot)), sampleRadius);
       if (pilot.scope === "global") {
         globalSamples[pilot.paletteState].push(observed);
       } else {
@@ -198,14 +147,14 @@ export function decodeCameraImage(
   }
   const localModels = new Map<string, ReturnType<typeof localizePalette>>();
   for (const [key, samples] of tileSamples) {
-    if (!samples.has(0) || !samples.has(LAB_CHROMA_RADIX)) continue;
+    if (!samples.has(0) || !samples.has(LAB_PALETTE_SIZE - 1)) continue;
     try {
-      localModels.set(key, localizePalette(
-        globalPalette,
-        [samples.get(0) as Rgb, samples.get(LAB_CHROMA_RADIX) as Rgb],
-      ));
+      localModels.set(key, localizePalette(globalPalette, [
+        samples.get(0) as Rgb,
+        samples.get(LAB_PALETTE_SIZE - 1) as Rgb,
+      ]));
     } catch {
-      // A damaged local anchor falls back to the spatially distributed global model.
+      // A damaged local anchor falls back to the global 16-color model.
     }
   }
 
@@ -216,25 +165,22 @@ export function decodeCameraImage(
   try {
     for (const cell of matrix.payloadCells) {
       const model = localModels.get(tileKey(cell.tileRow, cell.tileColumn)) ?? globalPalette;
-      const expectedDark = matrix.bits[cell.index] === 1;
       const classified = classifyColor(
-        sampleRgb(image, projectPoint(homography, moduleCenter(cell)), sampleRadius),
+        sampleRgb(image, projectPoint(homography, logicalModuleCenter(cell)), sampleRadius),
         model,
         erasureThreshold,
-        expectedDark,
       );
-      const erasure = classified.erasure;
       confidences.push(classified.confidence);
       reliabilities.push(classified.confidence / (1 + classified.bestDistance));
-      if (erasure) erasures += 1;
-      observedStates.push(erasure ? null : classified.symbol);
+      if (classified.erasure) erasures += 1;
+      observedStates.push(classified.erasure ? null : classified.symbol);
     }
   } catch (error) {
     throw staged("sampling", error);
   }
 
   try {
-    const decoded = decodeIntegratedPaletteSymbols(observedStates, matrix, undefined, reliabilities);
+    const decoded = decodePrismPaletteSymbols(observedStates, matrix, undefined, reliabilities);
     const confidence = confidences.length === 0
       ? 0
       : confidences.reduce((sum, value) => sum + value, 0) / confidences.length;
@@ -251,6 +197,243 @@ export function decodeCameraImage(
   }
 }
 
+function scanFinderCandidates(binary: Uint8Array, width: number, height: number): FinderCandidate[] {
+  const candidates: FinderCandidate[] = [];
+  const rowStep = height > 900 ? 2 : 1;
+  for (let y = 0; y < height; y += rowStep) {
+    const runs: Array<{ dark: boolean; start: number; length: number }> = [];
+    let start = 0;
+    let dark = binary[y * width] === 1;
+    for (let x = 1; x <= width; x += 1) {
+      const nextDark = x < width ? binary[(y * width) + x] === 1 : !dark;
+      if (x < width && nextDark === dark) continue;
+      runs.push({ dark, start, length: x - start });
+      start = x;
+      dark = nextDark;
+    }
+    for (let run = 0; run + 4 < runs.length; run += 1) {
+      const group = runs.slice(run, run + 5);
+      if (!group[0].dark || group[1].dark || !group[2].dark || group[3].dark || !group[4].dark) continue;
+      const counts = group.map((entry) => entry.length);
+      if (!finderRatio(counts)) continue;
+      const centerX = group[2].start + (group[2].length / 2);
+      const vertical = crossCheck(binary, width, height, Math.round(centerX), y, 0, 1);
+      if (!vertical) continue;
+      const horizontal = crossCheck(binary, width, height, Math.round(centerX), Math.round(vertical.center), 1, 0);
+      if (!horizontal) continue;
+      const moduleSize = (counts.reduce((sum, value) => sum + value, 0) / 7
+        + vertical.moduleSize + horizontal.moduleSize) / 3;
+      mergeCandidate(candidates, horizontal.center, vertical.center, moduleSize);
+    }
+  }
+  return candidates.filter((candidate) => candidate.votes >= 2 && candidate.moduleSize >= 1.4)
+    .sort((left, right) => right.votes - left.votes || right.moduleSize - left.moduleSize)
+    .slice(0, 16);
+}
+
+function crossCheck(
+  binary: Uint8Array,
+  width: number,
+  height: number,
+  startX: number,
+  startY: number,
+  dx: number,
+  dy: number,
+): PatternCrossCheck | null {
+  if (!inside(startX, startY, width, height) || binary[(startY * width) + startX] !== 1) return null;
+  const negative: number[] = [];
+  const positive: number[] = [];
+  for (const direction of [-1, 1]) {
+    let x = startX + (direction < 0 ? 0 : dx);
+    let y = startY + (direction < 0 ? 0 : dy);
+    const counts = direction < 0 ? negative : positive;
+    for (const expectedDark of [true, false, true]) {
+      let count = 0;
+      while (inside(x, y, width, height) && (binary[(y * width) + x] === 1) === expectedDark) {
+        count += 1;
+        x += dx * direction;
+        y += dy * direction;
+      }
+      if (count === 0) return null;
+      counts.push(count);
+    }
+  }
+  const centerCount = negative[0] + positive[0];
+  const counts = [negative[2], negative[1], centerCount, positive[1], positive[2]];
+  if (!finderRatio(counts)) return null;
+  const centerStart = (dx === 1 ? startX : startY) - negative[0] + 1;
+  return {
+    center: centerStart + (centerCount / 2),
+    moduleSize: counts.reduce((sum, value) => sum + value, 0) / 7,
+    total: counts.reduce((sum, value) => sum + value, 0),
+  };
+}
+
+function finderRatio(counts: readonly number[]): boolean {
+  const total = counts.reduce((sum, value) => sum + value, 0);
+  if (total < 7) return false;
+  const moduleWidth = total / 7;
+  const outerTolerance = Math.max(1.5, moduleWidth * 0.9);
+  const centerTolerance = Math.max(2.5, moduleWidth * 1.45);
+  return Math.abs(counts[0] - moduleWidth) <= outerTolerance
+    && Math.abs(counts[1] - moduleWidth) <= outerTolerance
+    && Math.abs(counts[2] - (3 * moduleWidth)) <= centerTolerance
+    && Math.abs(counts[3] - moduleWidth) <= outerTolerance
+    && Math.abs(counts[4] - moduleWidth) <= outerTolerance;
+}
+
+function mergeCandidate(candidates: FinderCandidate[], x: number, y: number, moduleSize: number) {
+  const existing = candidates.find((candidate) => (
+    distance(candidate, { x, y }) <= Math.max(3, moduleSize * 2)
+    && Math.max(candidate.moduleSize, moduleSize) / Math.max(0.1, Math.min(candidate.moduleSize, moduleSize)) < 1.8
+  ));
+  if (!existing) {
+    candidates.push({ x, y, moduleSize, votes: 1 });
+    return;
+  }
+  const nextVotes = existing.votes + 1;
+  existing.x = ((existing.x * existing.votes) + x) / nextVotes;
+  existing.y = ((existing.y * existing.votes) + y) / nextVotes;
+  existing.moduleSize = ((existing.moduleSize * existing.votes) + moduleSize) / nextVotes;
+  existing.votes = nextVotes;
+}
+
+function selectFinderQuad(candidates: readonly FinderCandidate[]): Readonly<{ points: readonly Point[]; score: number }> | null {
+  if (candidates.length < 4) return null;
+  let best: { points: readonly Point[]; score: number } | null = null;
+  for (let a = 0; a < candidates.length - 3; a += 1) {
+    for (let b = a + 1; b < candidates.length - 2; b += 1) {
+      for (let c = b + 1; c < candidates.length - 1; c += 1) {
+        for (let d = c + 1; d < candidates.length; d += 1) {
+          const group = [candidates[a], candidates[b], candidates[c], candidates[d]];
+          const points = orderImageQuad(group);
+          if (!points) continue;
+          const sides = points.map((point, index) => distance(point, points[(index + 1) % 4]));
+          const meanModule = group.reduce((sum, candidate) => sum + candidate.moduleSize, 0) / group.length;
+          const normalizedSides = sides.map((side) => side / meanModule);
+          if (Math.min(...normalizedSides) < 20 || Math.max(...normalizedSides) > 55) continue;
+          if (Math.max(...sides) / Math.max(1, Math.min(...sides)) > 2.6) continue;
+          const area = polygonArea(points);
+          if (area < (meanModule * FINDER_DISTANCE_MODULES) ** 2 * 0.2) continue;
+          const diagonals = [distance(points[0], points[2]), distance(points[1], points[3])];
+          if (Math.max(...diagonals) / Math.max(1, Math.min(...diagonals)) > 1.8) continue;
+          const moduleSpread = Math.max(...group.map((candidate) => candidate.moduleSize))
+            / Math.max(0.1, Math.min(...group.map((candidate) => candidate.moduleSize)));
+          if (moduleSpread > 2.8) continue;
+          const votes = group.reduce((sum, candidate) => sum + candidate.votes, 0);
+          const sideError = normalizedSides.reduce((sum, side) => sum + Math.abs(side - FINDER_DISTANCE_MODULES), 0);
+          const score = (votes * 12) - sideError - (Math.abs(diagonals[0] - diagonals[1]) / meanModule);
+          if (!best || score > best.score) best = { points, score };
+        }
+      }
+    }
+  }
+  return best;
+}
+
+function orientFinderQuad(
+  grayscale: Uint8Array,
+  width: number,
+  height: number,
+  threshold: number,
+  imageQuad: readonly Point[],
+): Readonly<{ points: readonly Point[]; orientationScore: number }> | null {
+  const matrix = createPrismMatrix();
+  const permutations: Point[][] = [];
+  for (let rotation = 0; rotation < 4; rotation += 1) {
+    permutations.push(Array.from({ length: 4 }, (_, index) => imageQuad[(rotation + index) % 4]));
+    permutations.push(Array.from({ length: 4 }, (_, index) => imageQuad[modulo(rotation - index, 4)]));
+  }
+  let best: { points: readonly Point[]; orientationScore: number } | null = null;
+  for (const points of permutations) {
+    let homography: readonly number[];
+    try {
+      homography = solveHomography(PRISM_FINDER_CENTERS, points);
+    } catch {
+      continue;
+    }
+    let matches = 0;
+    let samples = 0;
+    for (let row = 0; row < matrix.size; row += 1) {
+      for (let column = 0; column < matrix.size; column += 1) {
+        const index = row * matrix.size + column;
+        if (!matrix.reserved[index]) continue;
+        const point = projectPoint(homography, { x: column + 0.5, y: row + 0.5 });
+        const x = Math.round(point.x);
+        const y = Math.round(point.y);
+        if (!inside(x, y, width, height)) continue;
+        const expectedDark = matrix.functionStates[index] === 0;
+        const observedDark = grayscale[(y * width) + x] <= threshold;
+        if (expectedDark === observedDark) matches += 1;
+        samples += 1;
+      }
+    }
+    if (samples === 0) continue;
+    const orientationScore = matches / samples;
+    if (!best || orientationScore > best.orientationScore) best = { points, orientationScore };
+  }
+  return best;
+}
+
+function orderImageQuad(points: readonly Point[]): readonly Point[] | null {
+  const bySum = [...points].sort((left, right) => (left.x + left.y) - (right.x + right.y));
+  const byDifference = [...points].sort((left, right) => (left.x - left.y) - (right.x - right.y));
+  const ordered = [bySum[0], byDifference[byDifference.length - 1], bySum[bySum.length - 1], byDifference[0]];
+  if (new Set(ordered).size !== 4 || polygonArea(ordered) <= 0) return null;
+  return ordered;
+}
+
+function pointsToLocation(points: readonly Point[]): QrLocation {
+  return {
+    topLeftCorner: points[0],
+    topRightCorner: points[1],
+    bottomRightCorner: points[2],
+    bottomLeftCorner: points[3],
+  };
+}
+
+function locationPoints(location: QrLocation): readonly Point[] {
+  return [location.topLeftCorner, location.topRightCorner, location.bottomRightCorner, location.bottomLeftCorner];
+}
+
+function toGrayscale(image: CameraPixelImage): Uint8Array {
+  const grayscale = new Uint8Array(image.width * image.height);
+  for (let pixel = 0, offset = 0; pixel < grayscale.length; pixel += 1, offset += 4) {
+    grayscale[pixel] = Math.round(
+      (0.299 * image.data[offset]) + (0.587 * image.data[offset + 1]) + (0.114 * image.data[offset + 2]),
+    );
+  }
+  return grayscale;
+}
+
+function otsuThreshold(grayscale: Uint8Array): number {
+  const histogram = new Uint32Array(256);
+  let weightedTotal = 0;
+  for (const value of grayscale) {
+    histogram[value] += 1;
+    weightedTotal += value;
+  }
+  let backgroundWeight = 0;
+  let backgroundWeighted = 0;
+  let bestVariance = -1;
+  let bestThreshold = 127;
+  for (let threshold = 0; threshold < 255; threshold += 1) {
+    backgroundWeight += histogram[threshold];
+    if (backgroundWeight === 0) continue;
+    const foregroundWeight = grayscale.length - backgroundWeight;
+    if (foregroundWeight === 0) break;
+    backgroundWeighted += threshold * histogram[threshold];
+    const backgroundMean = backgroundWeighted / backgroundWeight;
+    const foregroundMean = (weightedTotal - backgroundWeighted) / foregroundWeight;
+    const variance = backgroundWeight * foregroundWeight * ((backgroundMean - foregroundMean) ** 2);
+    if (variance > bestVariance) {
+      bestVariance = variance;
+      bestThreshold = threshold;
+    }
+  }
+  return Math.max(72, Math.min(190, bestThreshold));
+}
+
 function sampleRgb(image: CameraPixelImage, point: Point, radius: number): Rgb {
   const centerX = Math.round(point.x);
   const centerY = Math.round(point.y);
@@ -259,7 +442,7 @@ function sampleRgb(image: CameraPixelImage, point: Point, radius: number): Rgb {
     || centerY - radius < 0
     || centerX + radius >= image.width
     || centerY + radius >= image.height
-  ) throw new Error("the full QR symbol must remain inside the camera frame");
+  ) throw new Error("the full custom symbol must remain inside the camera frame");
   const red: number[] = [];
   const green: number[] = [];
   const blue: number[] = [];
@@ -272,107 +455,6 @@ function sampleRgb(image: CameraPixelImage, point: Point, radius: number): Rgb {
     }
   }
   return [median(red), median(green), median(blue)];
-}
-
-function centeredSquare(image: CameraPixelImage, ratio: number): Readonly<{
-  image: CameraPixelImage;
-  offsetX: number;
-  offsetY: number;
-}> {
-  const size = Math.max(1, Math.floor(Math.min(image.width, image.height) * ratio));
-  if (size === image.width && size === image.height) return { image, offsetX: 0, offsetY: 0 };
-  const offsetX = Math.floor((image.width - size) / 2);
-  const offsetY = Math.floor((image.height - size) / 2);
-  const data = new Uint8ClampedArray(size * size * 4);
-  for (let y = 0; y < size; y += 1) {
-    const sourceStart = (((offsetY + y) * image.width) + offsetX) * 4;
-    data.set(image.data.subarray(sourceStart, sourceStart + (size * 4)), y * size * 4);
-  }
-  return { image: { data, width: size, height: size }, offsetX, offsetY };
-}
-
-function projectColorCarrier(image: CameraPixelImage): CameraPixelImage {
-  const data = new Uint8ClampedArray(image.data.length);
-  const channelCeilings = estimateChannelCeilings(image);
-  const carrierValues = new Uint8Array(image.width * image.height);
-  const histogram = new Uint32Array(256);
-  let pixel = 0;
-  for (let offset = 0; offset < image.data.length; offset += 4) {
-    const carrier = Math.max(
-      image.data[offset] / channelCeilings[0],
-      image.data[offset + 1] / channelCeilings[1],
-      image.data[offset + 2] / channelCeilings[2],
-    );
-    const value = Math.max(0, Math.min(255, Math.round(carrier * 255)));
-    carrierValues[pixel] = value;
-    histogram[value] += 1;
-    pixel += 1;
-  }
-  // The profile constrains dark chroma peaks to <= 0.76 and light chroma
-  // peaks to >= 0.88 after per-channel normalization. Clamp Otsu inside that
-  // intentional guard band so black finder mass cannot pull the split to zero.
-  const threshold = Math.max(196, Math.min(220, otsuThreshold(histogram, carrierValues.length)));
-  for (let index = 0; index < carrierValues.length; index += 1) {
-    const offset = index * 4;
-    const value = carrierValues[index] <= threshold ? 0 : 255;
-    data[offset] = value;
-    data[offset + 1] = value;
-    data[offset + 2] = value;
-    data[offset + 3] = 255;
-  }
-  return { data, width: image.width, height: image.height };
-}
-
-function otsuThreshold(histogram: Uint32Array, total: number): number {
-  let weightedTotal = 0;
-  for (let value = 0; value < histogram.length; value += 1) weightedTotal += value * histogram[value];
-  let backgroundWeight = 0;
-  let backgroundWeighted = 0;
-  let bestVariance = -1;
-  let bestThreshold = 127;
-  for (let threshold = 0; threshold < histogram.length - 1; threshold += 1) {
-    backgroundWeight += histogram[threshold];
-    if (backgroundWeight === 0) continue;
-    const foregroundWeight = total - backgroundWeight;
-    if (foregroundWeight === 0) break;
-    backgroundWeighted += threshold * histogram[threshold];
-    const backgroundMean = backgroundWeighted / backgroundWeight;
-    const foregroundMean = (weightedTotal - backgroundWeighted) / foregroundWeight;
-    const variance = backgroundWeight * foregroundWeight * ((backgroundMean - foregroundMean) ** 2);
-    if (variance > bestVariance) {
-      bestVariance = variance;
-      bestThreshold = threshold;
-    }
-  }
-  return bestThreshold;
-}
-
-function estimateChannelCeilings(image: CameraPixelImage): Rgb {
-  const histograms = Array.from({ length: 3 }, () => new Uint32Array(256));
-  for (let offset = 0; offset < image.data.length; offset += 4) {
-    histograms[0][image.data[offset]] += 1;
-    histograms[1][image.data[offset + 1]] += 1;
-    histograms[2][image.data[offset + 2]] += 1;
-  }
-  const target = Math.max(1, Math.ceil(image.width * image.height * 0.98));
-  return histograms.map((histogram) => {
-    let cumulative = 0;
-    for (let value = 0; value < histogram.length; value += 1) {
-      cumulative += histogram[value];
-      if (cumulative >= target) return Math.max(32, value);
-    }
-    return 255;
-  }) as [number, number, number];
-}
-
-function offsetLocation(location: QrLocation, offsetX: number, offsetY: number): QrLocation {
-  const offset = (point: Point): Point => ({ x: point.x + offsetX, y: point.y + offsetY });
-  return {
-    topLeftCorner: offset(location.topLeftCorner),
-    topRightCorner: offset(location.topRightCorner),
-    bottomRightCorner: offset(location.bottomRightCorner),
-    bottomLeftCorner: offset(location.bottomLeftCorner),
-  };
 }
 
 function median(values: number[]): number {
@@ -397,6 +479,23 @@ function staged(stage: OpticalDecodeStage, error: unknown): OpticalDecodeError {
 
 function tileKey(tileRow: number, tileColumn: number): string {
   return `${tileRow}:${tileColumn}`;
+}
+
+function polygonArea(points: readonly Point[]): number {
+  let twiceArea = 0;
+  for (let index = 0; index < points.length; index += 1) {
+    const next = points[(index + 1) % points.length];
+    twiceArea += (points[index].x * next.y) - (next.x * points[index].y);
+  }
+  return Math.abs(twiceArea) / 2;
+}
+
+function inside(x: number, y: number, width: number, height: number): boolean {
+  return x >= 0 && y >= 0 && x < width && y < height;
+}
+
+function modulo(value: number, modulus: number): number {
+  return ((value % modulus) + modulus) % modulus;
 }
 
 function distance(left: Point, right: Point): number {
