@@ -20,12 +20,14 @@ content off the local device.
   license refresh, and customer-portal service.
 - `docs/`: product boundary, architecture, commercial model, and operations.
 
-The public browser experiment uses one custom 41 x 41 optical symbol rather
-than a QR beside a separate color panel. It intentionally drops ordinary QR
-reader compatibility so black, white, and fourteen additional colors can all
-carry four-bit payload symbols. Its geometry, calibration, error recovery, and
-capacity are specified in
-[the Prism C16 custom dynamic profile](docs/design/INTEGRATED_DYNAMIC_COLOR_QR.md).
+The public browser experiment now uses one borderless 60 x 34 dynamic optical
+field. It intentionally drops ordinary QR and Micro QR reader compatibility:
+all 2,040 touching cells carry protected data, while geometry, phase, and color
+references are weak distributed sequences superimposed over the field. The
+implemented modulation profiles contain 8, 16, 24, or 32 states (including
+black and white), use Cauchy-MDS inner repair, and transport real RFC 6330
+RaptorQ packets. Its algorithms and current verification boundary are specified
+in [the Prism native field profile](docs/design/INTEGRATED_DYNAMIC_COLOR_QR.md).
 
 ## Community and Pro boundary
 

@@ -116,11 +116,33 @@
 
 .senderCanvas {
   display: block;
-  width: min(100%, 656px);
+  width: min(100%, 960px);
   height: auto;
   margin-inline: auto;
   background: #fff;
   image-rendering: pixelated;
+}
+
+.profileControl {
+  display: grid;
+  grid-template-columns: auto minmax(220px, 340px);
+  align-items: center;
+  gap: 14px;
+  margin: 0 0 18px;
+  color: #aeb9c9;
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+  font-size: 0.76rem;
+  font-weight: 750;
+}
+
+.profileControl select {
+  min-height: 44px;
+  padding: 0 12px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  color: #e5ecf6;
+  background: #0b0f16;
+  font: inherit;
 }
 
 .metrics {
@@ -170,9 +192,9 @@
   position: absolute;
   top: 50%;
   left: 50%;
-  width: auto;
-  height: 82%;
-  aspect-ratio: 1;
+  width: min(88%, 780px);
+  height: auto;
+  aspect-ratio: 60 / 34;
   border: 2px solid rgba(112, 240, 189, 0.82);
   border-radius: 12px;
   box-shadow: 0 0 0 999px rgba(0, 0, 0, 0.16);
@@ -340,7 +362,8 @@
 
   .roleSwitch,
   .cameraActions,
-  .successPanel dl {
+  .successPanel dl,
+  .profileControl {
     grid-template-columns: 1fr;
   }
 
