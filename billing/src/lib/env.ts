@@ -42,9 +42,13 @@ const envSchema = z.object({
   STRIPE_WEBHOOK_SECRET: z.string().startsWith("whsec_"),
   STRIPE_PRICE_PRO_MONTHLY: z.string().startsWith("price_"),
   STRIPE_PRICE_PRO_ANNUAL: z.string().startsWith("price_"),
+  STRIPE_WEBHOOK_ENDPOINT_ID: z.string().startsWith("we_").optional(),
+  STRIPE_PORTAL_CONFIGURATION_ID: z.string().startsWith("bpc_").optional(),
+  STRIPE_LIVE_CANARY_CHARGE_ID: z.string().startsWith("ch_").optional(),
   OIDC_ISSUER: z.string().url(),
   OIDC_AUDIENCE: z.string().min(1),
   OIDC_JWKS_URL: z.string().url(),
+  OIDC_DISCOVERY_URL: z.string().url().optional(),
   APP_BASE_URL: z.string().url(),
   LICENSE_ISSUER: z.string().url().max(256),
   LICENSE_KEY_ID: z.string().regex(/^[A-Za-z0-9._-]{1,64}$/),
@@ -59,8 +63,24 @@ const envSchema = z.object({
   RATE_LIMIT_WINDOW_SECONDS: z.coerce.number().int().min(10).max(3600).default(60),
   RATE_LIMIT_DEFAULT_MAX: z.coerce.number().int().min(1).max(10_000).default(60),
   WEBHOOK_MAX_BYTES: z.coerce.number().int().min(1024).max(10_485_760).default(1_048_576),
+  PRODUCTION_TERMS_URL: z.string().url().optional(),
+  PRODUCTION_PRIVACY_URL: z.string().url().optional(),
+  PRODUCTION_SUPPORT_URL: z.string().url().optional(),
+  PRODUCTION_TERMS_VERSION: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+  PRODUCTION_TERMS_SHA256: z.string().regex(/^[a-f0-9]{64}$/).optional(),
+  LEGAL_APPROVAL_REFERENCE: z.string().min(3).max(256).optional(),
+  PRODUCTION_E2E_REFERENCE: z.string().min(3).max(256).optional(),
+  PRODUCTION_E2E_COMPLETED_AT: z.string().datetime({ offset: true }).optional(),
 }).superRefine((value, context) => {
-  for (const field of ["APP_BASE_URL", "OIDC_ISSUER", "OIDC_JWKS_URL", "LICENSE_ISSUER"] as const) {
+  const requiredUrls = ["APP_BASE_URL", "OIDC_ISSUER", "OIDC_JWKS_URL", "LICENSE_ISSUER"] as const;
+  const optionalUrls = [
+    "OIDC_DISCOVERY_URL",
+    "PRODUCTION_TERMS_URL",
+    "PRODUCTION_PRIVACY_URL",
+    "PRODUCTION_SUPPORT_URL",
+  ] as const;
+  for (const field of [...requiredUrls, ...optionalUrls] as const) {
+    if (!value[field]) continue;
     const url = new URL(value[field]);
     if (url.protocol === "https:") continue;
     const loopback = ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname);

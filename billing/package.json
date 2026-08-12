@@ -1,11 +1,11 @@
 {
   "name": "@dmoft/pro-billing",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
   "description": "DMOFT Pro Stripe subscription, entitlement, device activation, and offline license service",
   "engines": {
-    "node": ">=22.0.0"
+    "node": "22.x"
   },
   "scripts": {
     "dev": "next dev",
@@ -17,12 +17,15 @@
     "test:watch": "vitest",
     "keys:export": "node scripts/export-keyset.mjs",
     "db:migrate": "node scripts/migrate.mjs",
+    "readiness": "tsx scripts/production-readiness.ts",
+    "readiness:static": "tsx scripts/production-readiness.ts --static",
     "check": "npm run lint && npm run typecheck && npm run test && npm run build"
   },
   "dependencies": {
     "jose": "6.2.8",
     "next": "16.3.0",
     "pg": "8.23.0",
+    "raptorq": "^1.7.24",
     "react": "19.2.8",
     "react-dom": "19.2.8",
     "stripe": "22.4.0",
@@ -35,6 +38,7 @@
     "@types/react-dom": "19.2.4",
     "eslint": "9.39.5",
     "eslint-config-next": "16.3.0",
+    "tsx": "4.20.6",
     "typescript": "6.0.3",
     "vitest": "4.1.10"
   }

@@ -1,34 +1,32 @@
+import type { Metadata } from "next";
 import Link from "next/link";
+
+export const metadata: Metadata = { title: "Proプラン" };
 
 export default function Pricing() {
   return (
     <main id="main-content">
-      <h1>DMOFT Pro</h1>
-      <p>Choose monthly or annual recurring billing from the signed-in DMOFT Pro application.</p>
+      <p className="mode-label">DMOFT PRO</p>
+      <h1>Proプラン</h1>
+      <p>月額または年額の継続課金は、サインイン済みDMOFT Proアプリから開始します。</p>
       <section className="card" aria-labelledby="launch-plan-heading">
-        <h2 id="launch-plan-heading">Launch Pro plan</h2>
+        <h2 id="launch-plan-heading">提供する機能</h2>
         <ul>
-          <li>Live local camera capture</li>
-          <li>Adaptive optical scan pacing</li>
-          <li>Up to three active registered device keys per subscription</li>
-          <li>No free trial</li>
+          <li>ローカルでのライブカメラ読み取り</li>
+          <li>適応型の光学スキャン制御</li>
+          <li>1契約につき最大3台の登録端末鍵</li>
+          <li>端末バインドされたオフラインライセンス</li>
         </ul>
+        <p>Hybrid LAN、Wi-Fi Direct、USB転送はロードマップ機能で、現在のプランには含まれません。</p>
+      </section>
+      <section className="card" aria-labelledby="checkout-heading">
+        <h2 id="checkout-heading">決済について</h2>
         <p>
-          Hybrid LAN, Wi-Fi Direct, and USB transport are roadmap features and are not included.
+          アプリがOIDCアクセストークンを使用してStripe Checkout Sessionを要求します。
+          最終価格、更新周期、税金、利用条件はStripeの決済画面で確認します。
         </p>
       </section>
-      <section aria-labelledby="checkout-heading">
-        <h2 id="checkout-heading">Checkout</h2>
-        <p>
-          The application requests a Stripe-hosted subscription Checkout Session using your OIDC
-          access token. Checkout shows the current price, renewal interval, taxes, and final terms.
-        </p>
-        <p>
-          Review the final commercial terms during Checkout. The repository draft is not a customer
-          agreement until counsel approves and the operator publishes it.
-        </p>
-        <Link href="/">Read the product security boundary</Link>
-      </section>
+      <p><Link href="/?mode=pro">Free / Pro選択へ戻る</Link></p>
     </main>
   );
 }

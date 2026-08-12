@@ -12,11 +12,18 @@ Change Date, 2030-08-09, when this version changes to Apache-2.0.
 
 - Community: frame generation, decoding supplied images, optical transport,
   cryptographic container handling, and protocol interoperability.
-- Pro: explicit live-camera capture, localhost browser capture, and optional
-  adaptive capture pacing.
+- Pro: explicit live-camera capture, localhost browser capture, optional adaptive
+  capture pacing, and an experimental optically pinned hybrid transport adapter
+  boundary.
 
 Camera frames stay on the device. The browser UI sends bounded JPEG frames only
 to its loopback origin. It contains no telemetry or remote upload path.
+
+`dmoft_pro_client.hybrid` currently provides strict short-lived offers, packet
+envelopes, entitlement/session/channel-binding checks, and a bounded in-memory
+test adapter. It does not discover peers or open TLS/WebRTC/Wi-Fi Direct sockets;
+applications must not advertise hybrid transfer until a production adapter is
+implemented and certified.
 
 ## Install for development
 

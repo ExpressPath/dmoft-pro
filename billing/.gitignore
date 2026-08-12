@@ -3,5 +3,7 @@ node_modules/
 coverage/
 .env*
 !.env.example
+!.env.production.example
 *.log
 *.tsbuildinfo
+.vercel/

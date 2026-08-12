@@ -6,9 +6,11 @@ optical protocol. It adds explicit camera access, adaptive real-time scanning,
 and a Stripe-backed commercial entitlement system without moving optical frame
 content off the local device.
 
-> Status: engineering MVP. The protocol and safety checks are implemented and
-> tested, but the product has not completed independent cryptographic review,
-> camera certification, app-store review, or production payment deployment.
+> Status: engineering MVP with explicit experimental-extension and production
+> readiness skeletons. The protocol and safety checks are implemented and tested,
+> but the product has not completed independent cryptographic review, physical
+> camera certification, production hybrid-adapter validation, legal approval, or
+> a real production payment deployment.
 
 ## Repository layout
 
@@ -17,6 +19,18 @@ content off the local device.
 - `billing/`: Next.js Stripe Checkout, webhook, entitlement, device activation,
   license refresh, and customer-portal service.
 - `docs/`: product boundary, architecture, commercial model, and operations.
+
+The public browser experiment now uses one borderless 2,040-cell dynamic optical
+field. Its default is a near-balanced 20:13 outer rectangle with a 49/48-center
+affine-triangular lattice and full-area hexagonal Voronoi cells; wide triangular
+and square lattices remain measured fallbacks. It
+intentionally drops ordinary QR and Micro QR reader compatibility: all cells
+carry protected data, while geometry, phase, and color references are weak
+distributed sequences superimposed over the field. The
+implemented modulation profiles contain 8, 16, 24, or 32 states (including
+black and white), use Cauchy-MDS inner repair, and transport real RFC 6330
+RaptorQ packets. Its algorithms and current verification boundary are specified
+in [the Prism native field profile](docs/design/INTEGRATED_DYNAMIC_COLOR_QR.md).
 
 ## Community and Pro boundary
 
@@ -29,7 +43,7 @@ content off the local device.
 | Live camera device access | No | Yes |
 | Browser localhost capture UI | No | Yes |
 | Adaptive live scan control | No | Yes |
-| Hybrid LAN/Wi-Fi Direct/USB routing | No | Planned; not yet shipped |
+| Hybrid local transport coordinator | No network routing | Adapter contract; no production adapter |
 | Security fixes and interoperability updates | Yes | Inherited immediately |
 
 The paid boundary is an integration and operations boundary. Confidentiality,
@@ -63,6 +77,20 @@ npm.cmd install
 npm.cmd run dev
 ```
 
+Production release configuration is independently fail-closed:
+
+```powershell
+Set-Location billing
+npm.cmd run readiness:static
+npm.cmd run readiness
+```
+
+The full command performs read-only Stripe, PostgreSQL, OIDC/JWKS, and published
+policy probes. It cannot supply business verification, legal approval, real
+secrets, domains, or the required refunded live canary; those remain explicit
+operator-controlled gates documented in
+[the production-readiness design](docs/design/STRIPE_PRODUCTION_READINESS.md).
+
 The local UI must bind to loopback. Camera access is requested only after a
 user gesture and can be stopped at any time. Captured frames are decoded by the
 local service and are not sent to the billing service.
@@ -89,3 +117,9 @@ Do not use this MVP as the sole control for high-value financial authorization.
 Review [SECURITY.md](SECURITY.md), keep explicit confirmation on the receiving
 device, and independently validate the Community cryptographic implementation
 before production use.
+
+Repository publishing uses keyring-backed GitHub CLI authentication and never
+stores passkeys or tokens in project files. Run
+`powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\verify-github-auth.ps1`
+and see
+[GitHub authentication](docs/GITHUB_AUTHENTICATION.md).

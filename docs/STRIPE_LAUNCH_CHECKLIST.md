@@ -39,7 +39,9 @@ Create and attach Billing Entitlement features with stable lookup keys:
 - `dmoft_pro` -> tier `pro`
 - `dmoft_offline_grace` -> permits the configured grace period
 
-Do not attach `dmoft_hybrid_transport` until hybrid transport ships.
+Do not attach `dmoft_hybrid_transport` until a real transport adapter passes its
+physical benchmark and security gates. The in-memory coordinator skeleton does
+not satisfy this launch condition.
 
 Store Price IDs in `STRIPE_PRICE_PRO_MONTHLY` and
 `STRIPE_PRICE_PRO_ANNUAL`. Client requests select exactly `pro_monthly` or
@@ -112,3 +114,14 @@ where its native crypto backend loads, and a human has reviewed the customer-fac
 price and policy text. Make a low-value real transaction, verify entitlement and
 portal cancellation end to end, confirm that the Checkout Session records terms
 acceptance, then refund it according to the published policy.
+
+Run the executable gates before and after the refunded live canary:
+
+```powershell
+Set-Location billing
+npm.cmd run readiness:static
+npm.cmd run readiness
+```
+
+Archive the versioned JSON report. Any failed or unavailable check blocks launch;
+the commands perform read-only probes and never create or refund Stripe objects.
